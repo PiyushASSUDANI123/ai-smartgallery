@@ -41,6 +41,10 @@ app.add_middleware(GZipMiddleware, minimum_size=500)
 # Include the API router
 app.include_router(api_router)
 
+@app.get("/")
+def read_root():
+    return {"status": "ok", "message": "Backend is running flawlessly 🚀"}
+
 @app.on_event("startup")
 async def startup_event():
     logger.info("Initializing services and tables...")
