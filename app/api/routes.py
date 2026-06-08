@@ -1065,19 +1065,34 @@ async def upload_event_photos(
     
     start_time = datetime.datetime.now()
     file_contents = []
-    for file in files:
-        content_type = file.content_type or ""
-        ext = os.path.splitext(file.filename)[1].lower()
-        if content_type.startswith("image/") or ext in {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".heic", ".heif", ".tiff", ".gif"}:
-            content = await file.read()
-            file_contents.append((file.filename, content, content_type))
-        await file.close()
+    photo_ids_map = []
+    
+    with get_db() as conn:
+        for file in files:
+            content_type = file.content_type or ""
+            ext = os.path.splitext(file.filename)[1].lower()
+            if content_type.startswith("image/") or ext in {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".heic", ".heif", ".tiff", ".gif"}:
+                content = await file.read()
+                
+                cursor = conn.execute(
+                    """
+                    INSERT INTO event_photos (event_id, file_id, file_size, faces_scanned)
+                    VALUES (?, ?, ?, 0)
+                    RETURNING id
+                    """,
+                    (event_id, "pending_upload", 0)
+                )
+                photo_id = cursor.fetchone()["id"]
+                
+                file_contents.append((file.filename, content, content_type, photo_id))
+                photo_ids_map.append({"filename": file.filename, "photo_id": photo_id})
+            await file.close()
 
     async def background_upload(event_id_str: str, files_data: list, owner_usr: str, prio: str, max_stor: int):
         saved_files = []
         total_uploaded_bytes = 0
         
-        async def process_single(filename, content, ctype):
+        async def process_single(filename, content, ctype, photo_id):
             nonlocal total_uploaded_bytes
             if prio == "low":
                 await asyncio.sleep(0.5)
@@ -1089,21 +1104,20 @@ async def upload_event_photos(
                 total_uploaded_bytes += file_size
                 
                 with get_db() as conn:
-                    cursor = conn.execute(
+                    conn.execute(
                         """
-                        INSERT INTO event_photos (event_id, file_id, file_size, faces_scanned)
-                        VALUES (?, ?, ?, 0)
-                        RETURNING id
+                        UPDATE event_photos 
+                        SET file_id = ?, file_size = ?
+                        WHERE id = ?
                         """,
-                        (event_id_str, public_url, file_size)
+                        (public_url, file_size, photo_id)
                     )
-                    photo_id = cursor.fetchone()["id"]
                     return {"id": photo_id, "file_id": public_url}
             except Exception as e:
                 logger.error(f"Failed saving uploaded file {filename}: {e}")
                 return None
 
-        tasks = [process_single(fn, c, ct) for fn, c, ct in files_data]
+        tasks = [process_single(fn, c, ct, pid) for fn, c, ct, pid in files_data]
         results = await asyncio.gather(*tasks)
         for res in results:
             if res:
@@ -1119,8 +1133,38 @@ async def upload_event_photos(
     return {
         "status": "success",
         "message": f"Successfully queued {len(file_contents)} images for background uploading and scanning. You may safely close this page.",
-        "uploaded_count": len(file_contents)
+        "uploaded_count": len(file_contents),
+        "photo_ids": photo_ids_map
     }
+
+@router.post("/events/{event_id}/upgrade-photo")
+async def upgrade_photo_res(
+    event_id: str,
+    photo_id: int = Form(...),
+    file: UploadFile = File(...)
+):
+    check_event_active(event_id)
+    content = await file.read()
+    
+    try:
+        public_url, file_size = await asyncio.to_thread(
+            process_and_save_uploaded_image, content, file.filename, event_id
+        )
+    except Exception as e:
+        logger.error(f"Failed to upgrade photo {photo_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to upload high-res image.")
+        
+    with get_db() as conn:
+        conn.execute(
+            """
+            UPDATE event_photos 
+            SET file_id = ?, file_size = ?
+            WHERE id = ? AND event_id = ?
+            """,
+            (public_url, file_size, photo_id, event_id)
+        )
+        
+    return {"status": "success", "photo_id": photo_id, "file_id": public_url}
 
 @router.get("/events/{event_id}/photos")
 async def list_event_photos(event_id: str, selected_only: bool = Query(False)):
@@ -1182,9 +1226,11 @@ async def get_preview_photo(photo_id: int):
     with get_db() as conn:
         row = conn.execute(
             """
-            SELECT ep.file_id, ep.event_id, e.watermark_enabled, e.name as event_name
+            SELECT ep.file_id, ep.event_id, e.watermark_enabled, e.name as event_name,
+                   e.logo_filename, u.name as brand_name
             FROM event_photos ep
             JOIN events e ON ep.event_id = e.id
+            JOIN users u ON e.owner_username = u.username
             WHERE ep.id = ?
             """,
             (photo_id,)
@@ -1197,6 +1243,8 @@ async def get_preview_photo(photo_id: int):
     event_id = row["event_id"]
     watermark_enabled = row["watermark_enabled"]
     event_name = row["event_name"]
+    logo_filename = row["logo_filename"]
+    brand_name = row["brand_name"]
     
     image_path = file_id
     if not file_id:
@@ -1211,29 +1259,59 @@ async def get_preview_photo(photo_id: int):
     if not watermark_enabled:
         return RedirectResponse(url=download_url, status_code=301, headers={"Cache-Control": "public, max-age=31536000"})
         
-    def get_watermarked_bytes():
-        from PIL import Image, ImageDraw, ImageFont
-        import requests
-        from io import BytesIO
-        
-        response = requests.get(download_url)
-        image = Image.open(BytesIO(response.content))
-        if image.mode != "RGBA":
-            image = image.convert("RGBA")
+        def get_watermarked_bytes():
+            from PIL import Image, ImageDraw, ImageFont
+            import requests
+            from io import BytesIO
+            import os
+            from app.core.config import settings
             
-        txt = Image.new("RGBA", image.size, (255, 255, 255, 0))
-        d = ImageDraw.Draw(txt)
-        
-        watermark_str = f"PREVIEW - {event_name.upper()}"
-        w, h = image.size
-        
-        font = ImageFont.load_default()
-        for x in range(30, w, 280):
-            for y in range(30, h, 280):
-                d.text((x, y), watermark_str, fill=(255, 255, 255, 35), font=font)
+            response = requests.get(download_url)
+            image = Image.open(BytesIO(response.content))
+            if image.mode != "RGBA":
+                image = image.convert("RGBA")
                 
-        watermarked = Image.alpha_composite(image, txt)
-        rgb_im = watermarked.convert("RGB")
+            txt = Image.new("RGBA", image.size, (255, 255, 255, 0))
+            d = ImageDraw.Draw(txt)
+            
+            w, h = image.size
+            watermark_str = f"{brand_name.upper()} • {event_name.upper()}"
+            
+            try:
+                font = ImageFont.truetype("arial.ttf", int(w / 35))
+            except IOError:
+                font = ImageFont.load_default()
+                
+            # Draw diagonal repeating text
+            for x in range(30, w, int(w/2.5)):
+                for y in range(30, h, int(h/4)):
+                    d.text((x, y), watermark_str, fill=(255, 255, 255, 40), font=font)
+                    
+            # Center logo overlay
+            if logo_filename:
+                logo_path = os.path.join(settings.LOGOS_DIR, logo_filename)
+                if os.path.exists(logo_path):
+                    try:
+                        logo = Image.open(logo_path)
+                        if logo.mode != "RGBA":
+                            logo = logo.convert("RGBA")
+                        
+                        logo_w = int(w * 0.25)
+                        logo_h = int(logo_w * logo.height / logo.width)
+                        logo = logo.resize((logo_w, logo_h), Image.Resampling.LANCZOS)
+                        
+                        alpha = logo.split()[3]
+                        alpha = alpha.point(lambda p: p * 0.5) # 50% opacity
+                        logo.putalpha(alpha)
+                        
+                        logo_x = int((w - logo_w) / 2)
+                        logo_y = int((h - logo_h) / 2)
+                        txt.paste(logo, (logo_x, logo_y), logo)
+                    except Exception as e:
+                        pass
+                
+            watermarked = Image.alpha_composite(image, txt)
+            rgb_im = watermarked.convert("RGB")
         
         out_buf = BytesIO()
         rgb_im.save(out_buf, "JPEG", quality=80)
