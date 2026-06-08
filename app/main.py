@@ -3,6 +3,7 @@ import logging
 import asyncio
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from app.core.config import settings
@@ -30,6 +31,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Enable Compression for 10x faster JSON payloads
+app.add_middleware(GZipMiddleware, minimum_size=500)
 
 # Serve static assets
 # Local static files are no longer served as everything runs on Cloudinary

@@ -1209,7 +1209,7 @@ async def get_preview_photo(photo_id: int):
 
     image_path = download_url
     if not watermark_enabled:
-        return RedirectResponse(url=download_url)
+        return RedirectResponse(url=download_url, status_code=301, headers={"Cache-Control": "public, max-age=31536000"})
         
     def get_watermarked_bytes():
         from PIL import Image, ImageDraw, ImageFont
@@ -1285,7 +1285,7 @@ async def download_photo(photo_id: int):
     except Exception as e:
         raise HTTPException(status_code=500, detail="Could not fetch image from Telegram.")
         
-    return RedirectResponse(url=download_url)
+    return RedirectResponse(url=download_url, status_code=301, headers={"Cache-Control": "public, max-age=31536000"})
 
 # --- DUAL-SIDE FACE SEARCH MECHANICS ---
 @router.post("/find-matches", response_class=JSONResponse)
