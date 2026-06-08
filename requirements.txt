@@ -27,3 +27,4 @@ cloudinary==1.41.0
 psycopg2-binary==2.9.10
 supabase==2.10.0
 pillow_heif==0.21.0
+pydantic-settings==2.2.1
