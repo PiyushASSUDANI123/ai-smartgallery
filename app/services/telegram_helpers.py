@@ -15,6 +15,10 @@ def get_telegram_file_url(file_id: str) -> str:
         logger.error("TELEGRAM_BOT_TOKEN is missing")
         raise HTTPException(status_code=500, detail="Telegram configuration is missing.")
         
+    if file_id.startswith("http://") or file_id.startswith("https://"):
+        logger.info(f"Legacy Cloudinary URL detected, skipping Telegram API: {file_id}")
+        return file_id
+        
     try:
         url = f"https://api.telegram.org/bot{bot_token}/getFile?file_id={file_id}"
         response = requests.get(url)
