@@ -16,7 +16,8 @@ COPY requirements.txt .
 
 # Install Python dependencies
 # Using --no-cache-dir keeps the docker image smaller
-RUN pip install --no-cache-dir -r requirements.txt
+# CMAKE_BUILD_PARALLEL_LEVEL=1 prevents OOM (Exit code 137) during dlib compilation on Hugging Face
+RUN CMAKE_BUILD_PARALLEL_LEVEL=1 pip install --no-cache-dir -r requirements.txt
 
 # Copy the rest of the application code
 COPY . .
