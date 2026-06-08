@@ -56,21 +56,29 @@ class PostgresConnectionWrapper:
         # Return a raw psycopg2 cursor for init_db
         return self.conn.cursor()
 
+from psycopg2 import pool
+
+db_pool = None
+
+def init_pool():
+    global db_pool
+    if not db_pool:
+        db_pool = pool.ThreadedConnectionPool(1, 20, DB_URL)
+
 @contextmanager
 def get_db():
-    conn = None
+    if not db_pool:
+        init_pool()
+    conn = db_pool.getconn()
     try:
-        conn = psycopg2.connect(DB_URL)
         yield PostgresConnectionWrapper(conn)
         conn.commit()
     except Exception as e:
-        if conn:
-            conn.rollback()
+        conn.rollback()
         logger.error(f"Database transaction failed: {e}")
         raise
     finally:
-        if conn:
-            conn.close()
+        db_pool.putconn(conn)
 
 def init_db():
     logger.info(f"Initializing Supabase PostgreSQL database.")
@@ -128,7 +136,8 @@ def init_db():
                 CREATE TABLE IF NOT EXISTS face_encodings (
                     id SERIAL PRIMARY KEY,
                     photo_id INTEGER NOT NULL REFERENCES event_photos(id) ON DELETE CASCADE,
-                    encoding BYTEA NOT NULL
+                    encoding vector(128) NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
 

@@ -87,10 +87,10 @@ def scan_and_save_faces(photo_id: int, file_id: str):
         with get_db() as conn:
             conn.execute("DELETE FROM face_encodings WHERE photo_id = ?", (photo_id,))
             for enc in encodings:
-                enc_blob = serialize_encoding(enc)
+                enc_vector_str = str(enc.tolist())
                 conn.execute(
                     "INSERT INTO face_encodings (photo_id, encoding) VALUES (?, ?)",
-                    (photo_id, enc_blob)
+                    (photo_id, enc_vector_str)
                 )
             conn.execute(
                 "UPDATE event_photos SET faces_scanned = 1, faces_count = ? WHERE id = ?",
@@ -1385,39 +1385,24 @@ async def find_matches(
         ref_encoding = await asyncio.to_thread(extract_reference_encoding, public_url, model="cnn")
         
         with get_db() as conn:
+            ref_vector_str = str(ref_encoding.tolist())
             rows = conn.execute(
                 """
-                SELECT ep.id, ep.file_id, fe.encoding 
+                SELECT DISTINCT ep.id, ep.file_id 
                 FROM face_encodings fe
                 JOIN event_photos ep ON fe.photo_id = ep.id
                 WHERE ep.event_id = ? AND ep.faces_scanned = 1
+                  AND fe.encoding <-> ? <= ?
                 """,
-                (event_id,)
+                (event_id, ref_vector_str, tolerance)
             ).fetchall()
             
         matched_photos = []
-        import face_recognition
-        
-        photo_encodings = {}
         for row in rows:
-            p_id = row["id"]
-            fname = row["file_id"]
-            enc = deserialize_encoding(row["encoding"])
-            if p_id not in photo_encodings:
-                photo_encodings[p_id] = {"file_id": fname, "encodings": []}
-            photo_encodings[p_id]["encodings"].append(enc)
-            
-        def run_vector_search():
-            for p_id, val in photo_encodings.items():
-                encs = val["encodings"]
-                matches = face_recognition.compare_faces(encs, ref_encoding, tolerance=tolerance)
-                if any(matches):
-                    matched_photos.append({
-                        "id": p_id,
-                        "filename": val["file_id"]
-                    })
-                    
-        await asyncio.to_thread(run_vector_search)
+            matched_photos.append({
+                "id": row["id"],
+                "filename": row["file_id"]
+            })
         
         with get_db() as conn:
             metric = "search_success" if matched_photos else "search_fail"
