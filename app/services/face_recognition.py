@@ -51,10 +51,18 @@ def load_image_rgb(image_path: str) -> np.ndarray:
         FileNotFoundError: If the file does not exist.
         FaceRecognitionError: If the image cannot be decoded or loaded.
     """
+    if not image_path.startswith("http") and not os.path.isfile(image_path):
+        # Assume it's a Telegram file_id
+        from app.services.telegram_helpers import get_telegram_file_url
+        try:
+            image_path = get_telegram_file_url(image_path)
+        except Exception as e:
+            raise FileNotFoundError(f"Failed to resolve Telegram file_id '{image_path}': {e}")
+
     if image_path.startswith("http"):
         import requests
         import numpy as np
-        resp = requests.get(image_path)
+        resp = requests.get(image_path, timeout=20)
         resp.raise_for_status()
         nparr = np.frombuffer(resp.content, np.uint8)
         image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
