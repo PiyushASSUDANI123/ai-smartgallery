@@ -15,10 +15,9 @@ class Settings(BaseSettings):
     # Supabase / Postgres
     DATABASE_URL: str = os.environ.get("DATABASE_URL", "postgresql://postgres:Piyushassudani123@db.lpuaxvmqeaijyiqjbpfe.supabase.co:5432/postgres")
 
-    # Cloudinary Keys
-    CLOUDINARY_CLOUD_NAME: str = os.environ.get("CLOUDINARY_CLOUD_NAME", "")
-    CLOUDINARY_API_KEY: str = os.environ.get("CLOUDINARY_API_KEY", "")
-    CLOUDINARY_API_SECRET: str = os.environ.get("CLOUDINARY_API_SECRET", "")
+    # Telegram Config
+    TELEGRAM_BOT_TOKEN: str = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    TELEGRAM_CHANNEL_ID: str = os.environ.get("TELEGRAM_CHANNEL_ID", "")
 
     class Config:
         env_file = ".env"

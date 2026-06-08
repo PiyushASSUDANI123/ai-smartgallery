@@ -116,7 +116,7 @@ def init_db():
                 CREATE TABLE IF NOT EXISTS event_photos (
                     id SERIAL PRIMARY KEY,
                     event_id TEXT NOT NULL REFERENCES events(id) ON DELETE CASCADE,
-                    file_url TEXT NOT NULL,
+                    file_id TEXT NOT NULL,
                     file_size BIGINT DEFAULT 0,
                     faces_scanned INTEGER DEFAULT 0,
                     faces_count INTEGER DEFAULT 0,

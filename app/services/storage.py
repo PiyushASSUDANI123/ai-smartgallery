@@ -1,6 +1,5 @@
 import os
-import cloudinary
-import cloudinary.uploader
+import requests
 from fastapi import HTTPException, status
 from io import BytesIO
 from PIL import Image
@@ -14,43 +13,56 @@ logger = logging.getLogger("StorageService")
 # Register HEIC opener for PIL
 pillow_heif.register_heif_opener()
 
-# Configure Cloudinary
-if settings.CLOUDINARY_CLOUD_NAME and settings.CLOUDINARY_API_KEY and settings.CLOUDINARY_API_SECRET:
-    cloudinary.config(
-        cloud_name=settings.CLOUDINARY_CLOUD_NAME,
-        api_key=settings.CLOUDINARY_API_KEY,
-        api_secret=settings.CLOUDINARY_API_SECRET,
-        secure=True
-    )
-else:
-    logger.warning("Cloudinary credentials are not configured. Uploads will fail.")
-
-def upload_to_cloudinary(content: bytes, filename: str, event_id: str) -> str:
-    """Uploads a byte string directly to Cloudinary and returns the public URL."""
+def upload_to_telegram(content: bytes, filename: str, event_id: str) -> str:
+    """Uploads a byte string to Telegram Private Channel and returns the file_id."""
+    bot_token = settings.TELEGRAM_BOT_TOKEN
+    channel_id = settings.TELEGRAM_CHANNEL_ID
+    
+    if not bot_token or not channel_id:
+        logger.error("Telegram credentials are not configured.")
+        raise HTTPException(status_code=500, detail="Telegram configuration is missing.")
+        
     try:
-        # Construct a folder path based on event_id for organization
-        folder_path = f"gallery_events/{event_id}"
+        url = f"https://api.telegram.org/bot{bot_token}/sendDocument"
         
-        # Cloudinary automatically detects content type, we just pass the bytes
-        response = cloudinary.uploader.upload(
-            content,
-            folder=folder_path,
-            public_id=filename,
-            overwrite=True,
-            resource_type="image"
-        )
+        # Send as document to prevent compression and keep original quality
+        files = {
+            "document": (filename, content, "image/jpeg")
+        }
+        data = {
+            "chat_id": channel_id,
+            "caption": f"Event ID: {event_id} | File: {filename}"
+        }
         
-        # Return the secure public URL
-        return response.get("secure_url")
+        response = requests.post(url, data=data, files=files)
+        response.raise_for_status()
+        
+        resp_data = response.json()
+        if not resp_data.get("ok"):
+            logger.error(f"Telegram upload failed: {resp_data}")
+            raise HTTPException(status_code=500, detail="Failed to upload image to Telegram.")
+            
+        # Extract file_id from document
+        document = resp_data["result"].get("document")
+        if document:
+            return document["file_id"]
+        
+        # Fallback if sent as photo
+        photo = resp_data["result"].get("photo")
+        if photo:
+            return photo[-1]["file_id"]  # Last one is the highest resolution
+            
+        raise HTTPException(status_code=500, detail="Invalid response from Telegram.")
+            
     except Exception as e:
-        logger.error(f"Failed to upload to Cloudinary: {e}")
+        logger.error(f"Failed to upload to Telegram: {e}")
         raise HTTPException(status_code=500, detail="Failed to upload image to cloud storage.")
 
 def process_and_save_uploaded_image(content: bytes, filename: str, event_id: str) -> tuple[str, int]:
     """
     Validates any uploaded image format. If HEIC/HEIF or TIFF,
     converts it to JPEG with high quality (95) on the fly without loss.
-    Uploads the final image to Cloudinary and returns (public_url, file_size).
+    Uploads the final image to Telegram and returns (file_id, file_size).
     """
     safe_base = os.path.splitext(os.path.basename(filename))[0]
     ext = os.path.splitext(filename)[1].lower()
@@ -93,8 +105,10 @@ def process_and_save_uploaded_image(content: bytes, filename: str, event_id: str
     else:
         image.close()
         
-    # Upload to Cloudinary
-    public_url = upload_to_cloudinary(upload_content, safe_base, event_id)
-    logger.info(f"Successfully uploaded {filename} to Cloudinary: {public_url}")
+    final_filename = f"{safe_base}{final_ext}"
+        
+    # Upload to Telegram
+    file_id = upload_to_telegram(upload_content, final_filename, event_id)
+    logger.info(f"Successfully uploaded {filename} to Telegram with file_id: {file_id}")
     
-    return public_url, file_size
+    return file_id, file_size

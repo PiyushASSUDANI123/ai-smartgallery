@@ -24,7 +24,8 @@ pillow_heif.register_heif_opener()
 from app.db.database import init_db, get_db, serialize_encoding, deserialize_encoding, hash_password
 # Face matcher core
 from app.services.face_recognition import extract_reference_encoding, FaceRecognitionError
-from app.services.storage import process_and_save_uploaded_image, upload_to_cloudinary
+from app.services.storage import process_and_save_uploaded_image, upload_to_telegram
+from app.services.telegram_helpers import get_telegram_file_url
 
 # Configure logging
 logging.basicConfig(
@@ -55,7 +56,7 @@ def shutdown_event():
 
 # --- BACKGROUND AI PROCESSING ---
 
-def scan_and_save_faces(photo_id: int, file_url: str):
+def scan_and_save_faces(photo_id: int, file_id: str):
     import face_recognition
     try:
         from app.services.face_recognition import load_image_rgb, resize_image_if_large
@@ -64,8 +65,9 @@ def scan_and_save_faces(photo_id: int, file_url: str):
         import numpy as np
         from PIL import Image
         
-        # Download image from Cloudinary
-        response = requests.get(file_url)
+        # Download image from Telegram
+        download_url = get_telegram_file_url(file_id)
+        response = requests.get(download_url)
         response.raise_for_status()
         
         image = Image.open(BytesIO(response.content))
@@ -75,10 +77,12 @@ def scan_and_save_faces(photo_id: int, file_url: str):
         rgb_image = np.array(image)
         rgb_image = resize_image_if_large(rgb_image, max_width=1024)
         
-        face_locations = face_recognition.face_locations(rgb_image, model="hog")
+        # CNN model is heavily optimized for side-poses and extreme angles
+        face_locations = face_recognition.face_locations(rgb_image, number_of_times_to_upsample=1, model="cnn")
         encodings = []
         if face_locations:
-            encodings = face_recognition.face_encodings(rgb_image, face_locations)
+            # High jitters for maximum robustness (lenient/powerful matching)
+            encodings = face_recognition.face_encodings(rgb_image, face_locations, num_jitters=10)
             
         with get_db() as conn:
             conn.execute("DELETE FROM face_encodings WHERE photo_id = ?", (photo_id,))
@@ -107,7 +111,7 @@ async def ingestion_worker(event_id: str):
         photo = None
         with get_db() as conn:
             row = conn.execute(
-                "SELECT id, file_url FROM event_photos WHERE event_id = ? AND faces_scanned = 0 LIMIT 1",
+                "SELECT id, file_id FROM event_photos WHERE event_id = ? AND faces_scanned = 0 LIMIT 1",
                 (event_id,)
             ).fetchone()
             if row:
@@ -117,10 +121,10 @@ async def ingestion_worker(event_id: str):
             break
             
         photo_id = photo["id"]
-        file_url = photo["file_url"]
+        file_id = photo["file_id"]
         
         # Run face detector without blocking FastAPI async loop
-        await asyncio.to_thread(scan_and_save_faces, photo_id, file_url)
+        await asyncio.to_thread(scan_and_save_faces, photo_id, file_id)
         
     logger.info(f"Finished ingestion worker for event: {event_id}")
 
@@ -858,7 +862,7 @@ async def upload_logo(event_id: str, file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail="Unsupported logo image format.")
         
     content = await file.read()
-    public_url = upload_to_cloudinary(content, f"{event_id}_logo", "logos")
+    public_url = upload_to_telegram(content, f"{event_id}_logo.jpg", event_id)
         
     with get_db() as conn:
         conn.execute("UPDATE events SET logo_filename = ? WHERE id = ?", (public_url, event_id))
@@ -1087,14 +1091,14 @@ async def upload_event_photos(
                 with get_db() as conn:
                     cursor = conn.execute(
                         """
-                        INSERT INTO event_photos (event_id, file_url, file_size, faces_scanned)
+                        INSERT INTO event_photos (event_id, file_id, file_size, faces_scanned)
                         VALUES (?, ?, ?, 0)
                         RETURNING id
                         """,
                         (event_id_str, public_url, file_size)
                     )
                     photo_id = cursor.fetchone()["id"]
-                    return {"id": photo_id, "file_url": public_url}
+                    return {"id": photo_id, "file_id": public_url}
             except Exception as e:
                 logger.error(f"Failed saving uploaded file {filename}: {e}")
                 return None
@@ -1122,7 +1126,7 @@ async def upload_event_photos(
 async def list_event_photos(event_id: str, selected_only: bool = Query(False)):
     check_event_active(event_id)
     query = """
-        SELECT ep.id, ep.file_url, ep.file_size, ep.faces_scanned, ep.faces_count, 
+        SELECT ep.id, ep.file_id, ep.file_size, ep.faces_scanned, ep.faces_count, 
                CASE WHEN ps.selected = 1 THEN 1 ELSE 0 END as selected
         FROM event_photos ep
         LEFT JOIN photo_selections ps ON ep.id = ps.photo_id
@@ -1140,12 +1144,12 @@ async def list_event_photos(event_id: str, selected_only: bool = Query(False)):
 @router.delete("/photos/{photo_id}")
 async def delete_photo(photo_id: int):
     with get_db() as conn:
-        row = conn.execute("SELECT event_id, file_url FROM event_photos WHERE id = ?", (photo_id,)).fetchone()
+        row = conn.execute("SELECT event_id, file_id FROM event_photos WHERE id = ?", (photo_id,)).fetchone()
     if not row:
         raise HTTPException(status_code=404, detail="Photo not found.")
         
     event_id = row["event_id"]
-    file_url = row["file_url"]
+    file_id = row["file_id"]
     
     # No local file to delete, Cloudinary deletion logic can be added later if needed
             
@@ -1178,7 +1182,7 @@ async def get_preview_photo(photo_id: int):
     with get_db() as conn:
         row = conn.execute(
             """
-            SELECT ep.file_url, ep.event_id, e.watermark_enabled, e.name as event_name
+            SELECT ep.file_id, ep.event_id, e.watermark_enabled, e.name as event_name
             FROM event_photos ep
             JOIN events e ON ep.event_id = e.id
             WHERE ep.id = ?
@@ -1189,24 +1193,30 @@ async def get_preview_photo(photo_id: int):
     if not row:
         raise HTTPException(status_code=404, detail="Photo not found.")
         
-    file_url = row["file_url"]
+    file_id = row["file_id"]
     event_id = row["event_id"]
     watermark_enabled = row["watermark_enabled"]
     event_name = row["event_name"]
     
-    image_path = file_url
-    if not file_url:
+    image_path = file_id
+    if not file_id:
         raise HTTPException(status_code=404, detail="File does not exist.")
         
+    try:
+        download_url = get_telegram_file_url(file_id)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="Could not fetch image from Telegram.")
+
+    image_path = download_url
     if not watermark_enabled:
-        return RedirectResponse(url=file_url)
+        return RedirectResponse(url=download_url)
         
     def get_watermarked_bytes():
         from PIL import Image, ImageDraw, ImageFont
         import requests
         from io import BytesIO
         
-        response = requests.get(file_url)
+        response = requests.get(download_url)
         image = Image.open(BytesIO(response.content))
         if image.mode != "RGBA":
             image = image.convert("RGBA")
@@ -1240,7 +1250,7 @@ async def get_preview_photo(photo_id: int):
         return StreamingResponse(buffer, media_type="image/jpeg")
     except Exception as e:
         logger.error(f"Watermark rendering failed: {e}")
-        return RedirectResponse(url=file_url)
+        return RedirectResponse(url=download_url)
     #image_path, media_type="image/jpeg")
 
 @router.get("/download-photo/{photo_id}")
@@ -1249,7 +1259,7 @@ async def download_photo(photo_id: int):
     with get_db() as conn:
         row = conn.execute(
             """
-            SELECT ep.file_url, ep.event_id, e.paywall_enabled 
+            SELECT ep.file_id, ep.event_id, e.paywall_enabled 
             FROM event_photos ep
             JOIN events e ON ep.event_id = e.id
             WHERE ep.id = ?
@@ -1266,18 +1276,23 @@ async def download_photo(photo_id: int):
             detail="This high-resolution original image is locked behind a paywall."
         )
         
-    file_url = row["file_url"]
-    if not file_url:
+    file_id = row["file_id"]
+    if not file_id:
         raise HTTPException(status_code=404, detail="File not found.")
         
-    return RedirectResponse(url=file_url)
+    try:
+        download_url = get_telegram_file_url(file_id)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="Could not fetch image from Telegram.")
+        
+    return RedirectResponse(url=download_url)
 
 # --- DUAL-SIDE FACE SEARCH MECHANICS ---
 @router.post("/find-matches", response_class=JSONResponse)
 async def find_matches(
     event_id: str = Query(...),
     file: UploadFile = File(...),
-    tolerance: float = Query(0.80)
+    tolerance: float = Query(0.65)
 ):
     check_event_active(event_id)
     start_time = datetime.datetime.now()
@@ -1286,15 +1301,15 @@ async def find_matches(
     temp_selfie_filename = f"reference_{uuid.uuid4().hex}_{os.path.basename(file.filename)}"
     
     try:
-        # Upload selfie directly to Cloudinary
-        public_url = upload_to_cloudinary(content, temp_selfie_filename, "temp_selfies")
+        # Upload selfie directly to Telegram
+        public_url = upload_to_telegram(content, f"{temp_selfie_filename}.jpg", "temp_selfies")
             
-        ref_encoding = await asyncio.to_thread(extract_reference_encoding, public_url, model="hog")
+        ref_encoding = await asyncio.to_thread(extract_reference_encoding, public_url, model="cnn")
         
         with get_db() as conn:
             rows = conn.execute(
                 """
-                SELECT ep.id, ep.file_url, fe.encoding 
+                SELECT ep.id, ep.file_id, fe.encoding 
                 FROM face_encodings fe
                 JOIN event_photos ep ON fe.photo_id = ep.id
                 WHERE ep.event_id = ? AND ep.faces_scanned = 1
@@ -1308,10 +1323,10 @@ async def find_matches(
         photo_encodings = {}
         for row in rows:
             p_id = row["id"]
-            fname = row["file_url"]
+            fname = row["file_id"]
             enc = deserialize_encoding(row["encoding"])
             if p_id not in photo_encodings:
-                photo_encodings[p_id] = {"file_url": fname, "encodings": []}
+                photo_encodings[p_id] = {"file_id": fname, "encodings": []}
             photo_encodings[p_id]["encodings"].append(enc)
             
         def run_vector_search():
@@ -1321,7 +1336,7 @@ async def find_matches(
                 if any(matches):
                     matched_photos.append({
                         "id": p_id,
-                        "filename": val["file_url"]
+                        "filename": val["file_id"]
                     })
                     
         await asyncio.to_thread(run_vector_search)
@@ -1378,26 +1393,30 @@ async def download_zip(
         if photo_ids and len(photo_ids) > 0:
             placeholders = ",".join("?" for _ in photo_ids)
             rows = conn.execute(
-                f"SELECT file_url FROM event_photos WHERE id IN ({placeholders}) AND event_id = ?",
+                f"SELECT file_id FROM event_photos WHERE id IN ({placeholders}) AND event_id = ?",
                 (*photo_ids, event_id)
             ).fetchall()
         else:
             rows = conn.execute(
-                "SELECT file_url FROM event_photos WHERE event_id = ?",
+                "SELECT file_id FROM event_photos WHERE event_id = ?",
                 (event_id,)
             ).fetchall()
         
-    file_urls = [r["file_url"] for r in rows]
+    file_ids = [r["file_id"] for r in rows]
     if not filenames:
         raise HTTPException(status_code=400, detail="No matching files found for zip download.")
         
     def build_zip() -> BytesIO:
         zip_buffer = BytesIO()
         with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
-            for idx, url in enumerate(file_urls):
-                resp = requests.get(url)
-                if resp.status_code == 200:
-                    zip_file.writestr(f"photo_{idx}.jpg", resp.content)
+            for idx, f_id in enumerate(file_ids):
+                try:
+                    url = get_telegram_file_url(f_id)
+                    resp = requests.get(url)
+                    if resp.status_code == 200:
+                        zip_file.writestr(f"photo_{idx}.jpg", resp.content)
+                except Exception:
+                    pass
                 
         zip_buffer.seek(0)
         return zip_buffer
