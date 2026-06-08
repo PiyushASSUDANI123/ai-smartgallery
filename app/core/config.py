@@ -13,11 +13,11 @@ class Settings(BaseSettings):
     # Load from environment variables (.env) or fallback to defaults
 # Cloudinary handles all file storage now
     # Supabase / Postgres
-    DATABASE_URL: str = os.environ.get("DATABASE_URL", "postgresql://postgres:Piyushassudani123@db.lpuaxvmqeaijyiqjbpfe.supabase.co:5432/postgres")
+    DATABASE_URL: str = os.environ.get("DATABASE_URL", "postgresql://postgres.lpuaxvmqeaijyiqjbpfe:Piyushassudani123@aws-1-ap-south-1.pooler.supabase.com:6543/postgres")
 
     # Telegram Config
-    TELEGRAM_BOT_TOKEN: str = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-    TELEGRAM_CHANNEL_ID: str = os.environ.get("TELEGRAM_CHANNEL_ID", "")
+    TELEGRAM_BOT_TOKEN: str = os.environ.get("TELEGRAM_BOT_TOKEN", "8521921505:AAG2XsYipSMFZRhJA10rFd9Cgtu2WGM4jb8")
+    TELEGRAM_CHANNEL_ID: str = os.environ.get("TELEGRAM_CHANNEL_ID", "-1003783865322")
 
     class Config:
         env_file = ".env"
