@@ -923,7 +923,7 @@ async def log_scan(event_id: str, request: Request):
             """
             SELECT id FROM analytics 
             WHERE event_id = ? AND visitor_ip = ? AND metric_type = 'qr_scan'
-            AND timestamp >= datetime('now', '-1 hour')
+            AND timestamp >= NOW() - INTERVAL '1 hour'
             LIMIT 1
             """,
             (event_id, visitor_ip)

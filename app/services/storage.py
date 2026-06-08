@@ -22,6 +22,7 @@ def upload_to_telegram(content: bytes, filename: str, event_id: str) -> str:
         logger.error("Telegram credentials are not configured.")
         raise HTTPException(status_code=500, detail="Telegram configuration is missing.")
         
+    import time
     try:
         url = f"https://api.telegram.org/bot{bot_token}/sendDocument"
         
@@ -34,8 +35,22 @@ def upload_to_telegram(content: bytes, filename: str, event_id: str) -> str:
             "caption": f"Event ID: {event_id} | File: {filename}"
         }
         
-        response = requests.post(url, data=data, files=files)
-        response.raise_for_status()
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                # Re-create files dict each attempt since requests might consume the file pointer
+                files_attempt = {
+                    "document": (filename, content, "image/jpeg")
+                }
+                response = requests.post(url, data=data, files=files_attempt, timeout=20)
+                response.raise_for_status()
+                break # Success
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    logger.warning(f"Telegram upload attempt {attempt + 1} failed: {e}. Retrying...")
+                    time.sleep(2 ** attempt) # Exponential backoff: 1s, 2s
+                else:
+                    raise # Rethrow on last attempt
         
         resp_data = response.json()
         if not resp_data.get("ok"):
