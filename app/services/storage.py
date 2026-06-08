@@ -13,7 +13,10 @@ logger = logging.getLogger("StorageService")
 # Register HEIC opener for PIL
 pillow_heif.register_heif_opener()
 
-def upload_to_telegram(content: bytes, filename: str, event_id: str) -> str:
+import httpx
+import asyncio
+
+async def upload_to_telegram(content: bytes, filename: str, event_id: str) -> str:
     """Uploads a byte string to Telegram Private Channel and returns the file_id."""
     bot_token = settings.TELEGRAM_BOT_TOKEN
     channel_id = settings.TELEGRAM_CHANNEL_ID
@@ -22,7 +25,6 @@ def upload_to_telegram(content: bytes, filename: str, event_id: str) -> str:
         logger.error("Telegram credentials are not configured.")
         raise HTTPException(status_code=500, detail="Telegram configuration is missing.")
         
-    import time
     try:
         url = f"https://api.telegram.org/bot{bot_token}/sendDocument"
         
@@ -38,17 +40,22 @@ def upload_to_telegram(content: bytes, filename: str, event_id: str) -> str:
         max_retries = 3
         for attempt in range(max_retries):
             try:
-                # Re-create files dict each attempt since requests might consume the file pointer
-                files_attempt = {
-                    "document": (filename, content, "image/jpeg")
-                }
-                response = requests.post(url, data=data, files=files_attempt, timeout=20)
-                response.raise_for_status()
-                break # Success
+                # httpx ka async client use karo jo thread block nahi karta
+                async with httpx.AsyncClient(timeout=45.0) as client:
+                    response = await client.post(url, data=data, files=files)
+                    response.raise_for_status()
+                    break # Success
+            except httpx.ReadTimeout:
+                if attempt < max_retries - 1:
+                    logger.warning(f"Telegram upload attempt {attempt + 1} timed out. Retrying...")
+                    await asyncio.sleep(2 ** attempt)
+                else:
+                    logger.error("Telegram API Gateway Timeout.")
+                    raise HTTPException(status_code=504, detail="Telegram API Gateway Timeout. Server is slow.")
             except Exception as e:
                 if attempt < max_retries - 1:
                     logger.warning(f"Telegram upload attempt {attempt + 1} failed: {e}. Retrying...")
-                    time.sleep(2 ** attempt) # Exponential backoff: 1s, 2s
+                    await asyncio.sleep(2 ** attempt) # Exponential backoff: 1s, 2s
                 else:
                     raise # Rethrow on last attempt
         
@@ -73,7 +80,7 @@ def upload_to_telegram(content: bytes, filename: str, event_id: str) -> str:
         logger.error(f"Failed to upload to Telegram: {e}")
         raise HTTPException(status_code=500, detail="Failed to upload image to cloud storage.")
 
-def process_and_save_uploaded_image(content: bytes, filename: str, event_id: str) -> tuple[str, int]:
+async def process_and_save_uploaded_image(content: bytes, filename: str, event_id: str) -> tuple[str, int]:
     """
     Validates any uploaded image format. If HEIC/HEIF or TIFF,
     converts it to JPEG with high quality (95) on the fly without loss.
@@ -82,48 +89,53 @@ def process_and_save_uploaded_image(content: bytes, filename: str, event_id: str
     safe_base = os.path.splitext(os.path.basename(filename))[0]
     ext = os.path.splitext(filename)[1].lower()
     
-    try:
-        image = Image.open(BytesIO(content))
-    except Exception as e:
-        logger.error(f"Failed to parse image {filename}: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Uploaded file '{filename}' is not a valid image format."
-        )
+    def process_image_sync():
+        try:
+            image = Image.open(BytesIO(content))
+        except Exception as e:
+            logger.error(f"Failed to parse image {filename}: {e}")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Uploaded file '{filename}' is not a valid image format."
+            )
 
-    # Check if HEIC/HEIF or TIFF
-    is_heic = ext in {".heic", ".heif"} or (hasattr(image, 'format') and image.format in {"HEIF", "HEIC"})
-    is_tiff = ext in {".tif", ".tiff"} or (hasattr(image, 'format') and image.format == "TIFF")
-    
-    file_size = len(content)
-    upload_content = content
-    final_ext = ext
-    
-    if is_heic or is_tiff:
-        final_ext = ".jpg"
+        # Check if HEIC/HEIF or TIFF
+        is_heic = ext in {".heic", ".heif"} or (hasattr(image, 'format') and image.format in {"HEIF", "HEIC"})
+        is_tiff = ext in {".tif", ".tiff"} or (hasattr(image, 'format') and image.format == "TIFF")
         
-        # Convert to RGB (JPEG doesn't support transparency/RGBA)
-        if image.mode != "RGB":
-            rgb_im = image.convert("RGB")
-        else:
-            rgb_im = image
+        file_size = len(content)
+        upload_content = content
+        final_ext = ext
+        
+        if is_heic or is_tiff:
+            final_ext = ".jpg"
             
-        img_byte_arr = BytesIO()
-        rgb_im.save(img_byte_arr, format="JPEG", quality=95)
-        upload_content = img_byte_arr.getvalue()
-        file_size = len(upload_content)
+            # Convert to RGB (JPEG doesn't support transparency/RGBA)
+            if image.mode != "RGB":
+                rgb_im = image.convert("RGB")
+            else:
+                rgb_im = image
+                
+            img_byte_arr = BytesIO()
+            rgb_im.save(img_byte_arr, format="JPEG", quality=95)
+            upload_content = img_byte_arr.getvalue()
+            file_size = len(upload_content)
+            
+            if rgb_im is not image:
+                rgb_im.close()
+            image.close()
+            logger.info(f"Converted {filename} to JPEG ({file_size} bytes)")
+        else:
+            image.close()
+            
+        final_filename = f"{safe_base}{final_ext}"
+        return upload_content, final_filename, file_size
+
+    # CPU-bound PIL tasks in background thread
+    upload_content, final_filename, file_size = await asyncio.to_thread(process_image_sync)
         
-        if rgb_im is not image:
-            rgb_im.close()
-        image.close()
-        logger.info(f"Converted {filename} to JPEG ({file_size} bytes)")
-    else:
-        image.close()
-        
-    final_filename = f"{safe_base}{final_ext}"
-        
-    # Upload to Telegram
-    file_id = upload_to_telegram(upload_content, final_filename, event_id)
+    # Upload to Telegram (Async)
+    file_id = await upload_to_telegram(upload_content, final_filename, event_id)
     logger.info(f"Successfully uploaded {filename} to Telegram with file_id: {file_id}")
     
     return file_id, file_size

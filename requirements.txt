@@ -29,3 +29,4 @@ supabase==2.10.0
 pillow_heif
 pydantic-settings==2.2.1
 qrcode[pil]
+httpx

@@ -62,7 +62,7 @@ def load_image_rgb(image_path: str) -> np.ndarray:
     if image_path.startswith("http"):
         import requests
         import numpy as np
-        resp = requests.get(image_path, timeout=20)
+        resp = requests.get(image_path, timeout=30.0)
         resp.raise_for_status()
         nparr = np.frombuffer(resp.content, np.uint8)
         image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)

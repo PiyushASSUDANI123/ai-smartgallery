@@ -862,7 +862,7 @@ async def upload_logo(event_id: str, file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail="Unsupported logo image format.")
         
     content = await file.read()
-    public_url = upload_to_telegram(content, f"{event_id}_logo.jpg", event_id)
+    public_url = await upload_to_telegram(content, f"{event_id}_logo.jpg", event_id)
         
     with get_db() as conn:
         conn.execute("UPDATE events SET logo_filename = ? WHERE id = ?", (public_url, event_id))
@@ -1100,7 +1100,8 @@ async def upload_event_photos(
                 if get_admin_storage_used(owner_usr) >= max_stor:
                     return None
                 
-                public_url, file_size = await asyncio.to_thread(process_and_save_uploaded_image, content, filename, event_id_str)
+                # Process the image, save it, and get file_id and size
+                public_url, file_size = await process_and_save_uploaded_image(content, filename, event_id_str)
                 total_uploaded_bytes += file_size
                 
                 with get_db() as conn:
@@ -1380,7 +1381,7 @@ async def find_matches(
     
     try:
         # Upload selfie directly to Telegram
-        public_url = upload_to_telegram(content, f"{temp_selfie_filename}.jpg", "temp_selfies")
+        public_url = await upload_to_telegram(content, f"{temp_selfie_filename}.jpg", "temp_selfies")
             
         ref_encoding = await asyncio.to_thread(extract_reference_encoding, public_url, model="cnn")
         
