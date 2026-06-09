@@ -61,9 +61,10 @@ async def upload_to_telegram(content: bytes, filename: str, event_id: str) -> st
                     raise HTTPException(status_code=504, detail="Telegram API Gateway Timeout. Server is slow.")
             except Exception as e:
                 if attempt < max_retries - 1:
-                    logger.warning(f"Telegram upload attempt {attempt + 1} failed: {e}. Retrying...")
+                    logger.warning(f"Telegram upload attempt {attempt + 1} failed ({type(e).__name__}): {e}. Retrying...")
                     await asyncio.sleep(2 ** attempt) # Exponential backoff: 1s, 2s
                 else:
+                    logger.error(f"Telegram upload failed completely after {max_retries} attempts: {type(e).__name__} - {e}")
                     raise # Rethrow on last attempt
         
         resp_data = response.json()

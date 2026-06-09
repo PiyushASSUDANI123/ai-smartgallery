@@ -19,7 +19,7 @@ class Settings(BaseSettings):
     # Telegram Config
     TELEGRAM_BOT_TOKEN: str = os.environ.get("TELEGRAM_BOT_TOKEN", "8521921505:AAG2XsYipSMFZRhJA10rFd9Cgtu2WGM4jb8")
     TELEGRAM_CHANNEL_ID: str = os.environ.get("TELEGRAM_CHANNEL_ID", "-1003783865322")
-    TELEGRAM_PROXY_URL: Optional[str] = os.environ.get("TELEGRAM_PROXY_URL", "http://50.114.102.16:8888")
+    TELEGRAM_PROXY_URL: Optional[str] = os.environ.get("TELEGRAM_PROXY_URL", "http://5.78.60.155:8080")
 
     class Config:
         env_file = ".env"
