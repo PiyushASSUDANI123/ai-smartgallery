@@ -20,8 +20,15 @@ def get_telegram_file_url(file_id: str) -> str:
         return file_id
         
     try:
+        proxies = None
+        if hasattr(settings, 'TELEGRAM_PROXY_URL') and settings.TELEGRAM_PROXY_URL:
+            proxies = {
+                "http": settings.TELEGRAM_PROXY_URL,
+                "https": settings.TELEGRAM_PROXY_URL
+            }
+
         url = f"https://api.telegram.org/bot{bot_token}/getFile?file_id={file_id}"
-        response = requests.get(url, timeout=30.0)
+        response = requests.get(url, timeout=30.0, proxies=proxies)
         response.raise_for_status()
         data = response.json()
         
