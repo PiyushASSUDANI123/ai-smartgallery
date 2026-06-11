@@ -1009,7 +1009,7 @@ async def get_event_qr(event_id: str, client_url: str = Query(None)):
         raise HTTPException(status_code=404, detail="Event not found.")
         
     pin = row["pin"]
-    target_url = client_url or f"http://localhost:50172/#/?event_id={event_id}"
+    target_url = client_url or f"https://smartgallery.piyushassudani.site/?event_id={event_id}"
     if pin:
         target_url += f"&pin={pin}"
     
