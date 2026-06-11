@@ -1241,6 +1241,29 @@ async def delete_photo(photo_id: int):
         conn.execute("DELETE FROM event_photos WHERE id = ?", (photo_id,))
     return {"status": "success", "message": "Photo deleted successfully."}
 
+@router.delete("/events/{event_id}/photos")
+async def delete_all_event_photos(event_id: str):
+    """Deletes ALL photos for an event from Cloudinary and the database."""
+    with get_db() as conn:
+        rows = conn.execute("SELECT id, file_url FROM event_photos WHERE event_id = ?", (event_id,)).fetchall()
+    
+    if not rows:
+        return {"status": "success", "deleted_count": 0, "message": "No photos to delete."}
+
+    # Delete each from Cloudinary in parallel background tasks
+    delete_tasks = [
+        delete_from_cloudinary(r["file_url"])
+        for r in rows if r["file_url"] and r["file_url"] != "pending_upload"
+    ]
+    await asyncio.gather(*delete_tasks, return_exceptions=True)
+
+    # Bulk DB delete
+    with get_db() as conn:
+        conn.execute("DELETE FROM event_photos WHERE event_id = ?", (event_id,))
+    
+    logger.info(f"Bulk deleted {len(rows)} photos for event {event_id}")
+    return {"status": "success", "deleted_count": len(rows), "message": f"{len(rows)} photos deleted."}
+
 @router.get("/events/{event_id}/ingestion-status")
 async def get_ingestion_status(event_id: str):
     check_event_active(event_id)
@@ -1340,12 +1363,12 @@ async def get_preview_photo(photo_id: int):
     if not file_url or file_url == "pending_upload":
         raise HTTPException(status_code=404, detail="File does not exist or is pending upload.")
         
-    # If watermark is disabled, stream directly to prevent CORS redirect issue in CanvasKit web app
+    # If watermark is disabled, stream directly (no caching to allow instant toggle)
     if not watermark_enabled:
         try:
             response = requests.get(file_url, timeout=30.0)
             response.raise_for_status()
-            return StreamingResponse(BytesIO(response.content), media_type="image/jpeg", headers={"Cache-Control": "public, max-age=31536000"})
+            return StreamingResponse(BytesIO(response.content), media_type="image/jpeg", headers={"Cache-Control": "no-cache"})
         except Exception as e:
             logger.error(f"Failed to stream raw preview image: {e}")
             raise HTTPException(status_code=500, detail="Could not retrieve preview image.")
