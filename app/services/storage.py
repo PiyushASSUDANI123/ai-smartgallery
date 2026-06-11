@@ -89,9 +89,10 @@ async def delete_from_cloudinary(file_url: str) -> bool:
 
 async def process_and_save_uploaded_image(content: bytes, filename: str, event_id: str) -> tuple[str, int]:
     """
-    Validates any uploaded image format. If HEIC/HEIF or TIFF,
-    converts it to JPEG with high quality (95) on the fly without loss.
-    Uploads the final image to Cloudinary and returns (public_url, file_size).
+    Validates any uploaded image format. 
+    - HEIC/HEIF/TIFF: converts to JPEG at maximum quality (browsers can't display these).
+    - JPEG/PNG/WebP/BMP/GIF: uploads the ORIGINAL bytes UNCHANGED — no quality loss.
+    Returns (public_url, file_size).
     """
     safe_base = os.path.splitext(os.path.basename(filename))[0]
     ext = os.path.splitext(filename)[1].lower()
@@ -106,34 +107,33 @@ async def process_and_save_uploaded_image(content: bytes, filename: str, event_i
                 detail=f"Uploaded file '{filename}' is not a valid image format."
             )
 
-        # Check if HEIC/HEIF or TIFF
+        # Check if HEIC/HEIF or TIFF - browsers cannot display these, must convert
         is_heic = ext in {".heic", ".heif"} or (hasattr(image, 'format') and image.format in {"HEIF", "HEIC"})
         is_tiff = ext in {".tif", ".tiff"} or (hasattr(image, 'format') and image.format == "TIFF")
         
         file_size = len(content)
         upload_content = content
-        final_ext = ext
         
         if is_heic or is_tiff:
-            final_ext = ".jpg"
-            
-            # Convert to RGB (JPEG doesn't support transparency/RGBA)
+            # Convert to JPEG at MAXIMUM quality (100) — no lossy compression
             if image.mode != "RGB":
                 rgb_im = image.convert("RGB")
             else:
                 rgb_im = image
                 
             img_byte_arr = BytesIO()
-            rgb_im.save(img_byte_arr, format="JPEG", quality=95)
+            rgb_im.save(img_byte_arr, format="JPEG", quality=100, subsampling=0)
             upload_content = img_byte_arr.getvalue()
             file_size = len(upload_content)
             
             if rgb_im is not image:
                 rgb_im.close()
             image.close()
-            logger.info(f"Converted {filename} to JPEG ({file_size} bytes)")
+            logger.info(f"Converted {filename} from {ext} to JPEG-100 ({file_size} bytes)")
         else:
+            # JPEG, PNG, WebP, BMP, GIF — upload original bytes as-is, NO compression
             image.close()
+            logger.info(f"Uploading {filename} as original ({file_size} bytes, no conversion)")
             
         return upload_content, file_size
 
@@ -145,3 +145,5 @@ async def process_and_save_uploaded_image(content: bytes, filename: str, event_i
     logger.info(f"Successfully uploaded {filename} to Cloudinary: {public_url}")
     
     return public_url, file_size
+
+

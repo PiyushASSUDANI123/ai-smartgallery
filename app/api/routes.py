@@ -77,15 +77,18 @@ def scan_and_save_faces(photo_id: int, file_url: Optional[str] = None, image_byt
             image = image.convert("RGB")
             
         rgb_image = np.array(image)
-        rgb_image = resize_image_if_large(rgb_image, max_width=1024)
+        rgb_image = resize_image_if_large(rgb_image, max_width=1280)
         
-        # Use dlib's highly accurate CNN model to locate all faces (including tilted, angled, profile, and half faces)
+        # PRIMARY: CNN model — detects tilted, angled, profile, and partially occluded faces
         face_locations = face_recognition.face_locations(rgb_image, number_of_times_to_upsample=1, model="cnn")
+        # FALLBACK: if CNN finds nothing, try HOG with upsample 2 for small/distant faces
+        if not face_locations:
+            face_locations = face_recognition.face_locations(rgb_image, number_of_times_to_upsample=2, model="hog")
 
         encodings = []
         if face_locations:
-            # Generate precise 128-d encodings using 3 jitters for higher accuracy
-            encodings = face_recognition.face_encodings(rgb_image, face_locations, num_jitters=3)
+            # 2 jitters: fast enough for bulk ingestion, precise enough for strict matching
+            encodings = face_recognition.face_encodings(rgb_image, face_locations, num_jitters=2)
             
         with get_db() as conn:
             conn.execute("DELETE FROM face_encodings WHERE photo_id = ?", (photo_id,))
@@ -885,7 +888,7 @@ async def upload_logo(event_id: str, file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail="Unsupported logo image format.")
         
     content = await file.read()
-    public_url = await upload_to_telegram(content, f"{event_id}_logo.jpg", event_id)
+    public_url = await asyncio.to_thread(upload_to_cloudinary, content, f"{event_id}_logo", event_id)
         
     with get_db() as conn:
         conn.execute("UPDATE events SET logo_filename = ? WHERE id = ?", (public_url, event_id))
@@ -1256,6 +1259,57 @@ async def get_ingestion_status(event_id: str):
     
     return {"status": "success", "total": total, "scanned": scanned}
 
+# --- SHARED WATERMARK UTILITY ---
+def _apply_watermark_to_bytes(file_url: str, brand_name: str, event_name: str) -> BytesIO:
+    """
+    Downloads the image from `file_url`, applies a diagonal semi-transparent watermark
+    overlay (brand + event name), and returns a BytesIO of the result as JPEG.
+    """
+    from PIL import Image, ImageDraw, ImageFont
+    import requests
+    from io import BytesIO
+
+    resp = requests.get(file_url, timeout=30.0)
+    resp.raise_for_status()
+    image = Image.open(BytesIO(resp.content))
+    if image.mode != "RGBA":
+        image = image.convert("RGBA")
+
+    txt = Image.new("RGBA", image.size, (255, 255, 255, 0))
+    d = ImageDraw.Draw(txt)
+    w, h = image.size
+    watermark_str = f"{brand_name.upper()} • {event_name.upper()}"
+
+    try:
+        font = ImageFont.truetype("arial.ttf", max(14, int(w / 35)))
+    except IOError:
+        try:
+            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", max(14, int(w / 35)))
+        except IOError:
+            font = ImageFont.load_default()
+
+    # Diagonal repeating watermark grid
+    step_x = max(int(w / 2.5), 200)
+    step_y = max(int(h / 4), 150)
+    for x in range(30, w + step_x, step_x):
+        for y in range(30, h + step_y, step_y):
+            d.text((x, y), watermark_str, fill=(255, 255, 255, 45), font=font)
+
+    watermarked = Image.alpha_composite(image, txt)
+    rgb_im = watermarked.convert("RGB")
+
+    out_buf = BytesIO()
+    rgb_im.save(out_buf, "JPEG", quality=92)
+    out_buf.seek(0)
+
+    image.close()
+    txt.close()
+    watermarked.close()
+    rgb_im.close()
+
+    return out_buf
+
+
 # --- DYNAMIC RENDERING & PROTECTION GATEWAYS ---
 @router.get("/preview-photo/{photo_id}")
 async def get_preview_photo(photo_id: int):
@@ -1296,71 +1350,12 @@ async def get_preview_photo(photo_id: int):
             logger.error(f"Failed to stream raw preview image: {e}")
             raise HTTPException(status_code=500, detail="Could not retrieve preview image.")
 
-    # Watermarked path
-    def get_watermarked_bytes():
-        from PIL import Image, ImageDraw, ImageFont
-        import requests
-        from io import BytesIO
-        import os
-        from app.core.config import settings
-        
-        response = requests.get(file_url, timeout=30.0)
-        image = Image.open(BytesIO(response.content))
-        if image.mode != "RGBA":
-            image = image.convert("RGBA")
-            
-        txt = Image.new("RGBA", image.size, (255, 255, 255, 0))
-        d = ImageDraw.Draw(txt)
-        
-        w, h = image.size
-        watermark_str = f"{brand_name.upper()} • {event_name.upper()}"
-        
-        try:
-            font = ImageFont.truetype("arial.ttf", int(w / 35))
-        except IOError:
-            font = ImageFont.load_default()
-            
-        # Draw diagonal repeating text
-        for x in range(30, w, int(w/2.5)):
-            for y in range(30, h, int(h/4)):
-                d.text((x, y), watermark_str, fill=(255, 255, 255, 40), font=font)
-                
-        # Center logo overlay
-        if logo_filename:
-            logo_path = os.path.join(settings.LOGOS_DIR, logo_filename)
-            if os.path.exists(logo_path):
-                try:
-                    logo = Image.open(logo_path)
-                    if logo.mode != "RGBA":
-                        logo = logo.convert("RGBA")
-                    
-                    logo_w = int(w * 0.25)
-                    logo_h = int(logo_w * logo.height / logo.width)
-                    logo = logo.resize((logo_w, logo_h), Image.Resampling.LANCZOS)
-                    
-                    alpha = logo.split()[3]
-                    alpha = alpha.point(lambda p: p * 0.5) # 50% opacity
-                    logo.putalpha(alpha)
-                    
-                    logo_x = int((w - logo_w) / 2)
-                    logo_y = int((h - logo_h) / 2)
-                    txt.paste(logo, (logo_x, logo_y), logo)
-                except Exception as e:
-                    pass
-            
-        watermarked = Image.alpha_composite(image, txt)
-        rgb_im = watermarked.convert("RGB")
-        
-        out_buf = BytesIO()
-        rgb_im.save(out_buf, "JPEG", quality=80)
-        out_buf.seek(0)
-        return out_buf
-
+    # Apply watermark using shared helper
     try:
-        buffer = await asyncio.to_thread(get_watermarked_bytes)
-        return StreamingResponse(buffer, media_type="image/jpeg")
+        buffer = await asyncio.to_thread(_apply_watermark_to_bytes, file_url, brand_name, event_name)
+        return StreamingResponse(buffer, media_type="image/jpeg", headers={"Cache-Control": "public, max-age=3600"})
     except Exception as e:
-        logger.error(f"Watermark rendering failed: {e}")
+        logger.error(f"Watermark rendering failed for preview: {e}")
         try:
             response = requests.get(file_url, timeout=30.0)
             return StreamingResponse(BytesIO(response.content), media_type="image/jpeg")
@@ -1373,9 +1368,11 @@ async def download_photo(photo_id: int):
     with get_db() as conn:
         row = conn.execute(
             """
-            SELECT ep.file_url, ep.event_id, e.paywall_enabled 
+            SELECT ep.file_url, ep.event_id, e.paywall_enabled,
+                   e.watermark_enabled, e.name as event_name, u.name as brand_name
             FROM event_photos ep
             JOIN events e ON ep.event_id = e.id
+            JOIN users u ON e.owner_username = u.username
             WHERE ep.id = ?
             """,
             (photo_id,)
@@ -1393,52 +1390,104 @@ async def download_photo(photo_id: int):
     file_url = row["file_url"]
     if not file_url or file_url == "pending_upload":
         raise HTTPException(status_code=404, detail="File not found.")
-        
-    return RedirectResponse(url=file_url)
+
+    watermark_enabled = row["watermark_enabled"]
+    event_name = row["event_name"]
+    brand_name = row["brand_name"]
+    
+    download_headers = {
+        "Content-Disposition": f"attachment; filename=photo_{photo_id}.jpg",
+        "Access-Control-Expose-Headers": "Content-Disposition"
+    }
+
+    if watermark_enabled:
+        # Apply watermark before download — user gets watermarked version
+        try:
+            buffer = await asyncio.to_thread(_apply_watermark_to_bytes, file_url, brand_name, event_name)
+            return StreamingResponse(buffer, media_type="image/jpeg", headers=download_headers)
+        except Exception as e:
+            logger.error(f"Watermark failed on download for photo {photo_id}: {e}")
+            # Fall through to stream without watermark
+
+    # Stream original bytes with download header (no redirect — fixes CORS in Flutter)
+    try:
+        resp = await asyncio.to_thread(lambda: requests.get(file_url, timeout=30.0))
+        resp.raise_for_status()
+        return StreamingResponse(BytesIO(resp.content), media_type="image/jpeg", headers=download_headers)
+    except Exception as e:
+        logger.error(f"Failed to stream download for photo {photo_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to download photo.")
 
 # --- DUAL-SIDE FACE SEARCH MECHANICS ---
 @router.post("/find-matches", response_class=JSONResponse)
 async def find_matches(
     event_id: str = Query(...),
     file: UploadFile = File(...),
-    tolerance: float = Query(0.78)
+    tolerance: float = Query(0.52)
 ):
     check_event_active(event_id)
     start_time = datetime.datetime.now()
     content = await file.read()
     
-    # Enforce minimum tolerance of 0.78 for lenient matching (96%+ recall for angled/profile/half faces)
-    tolerance = max(tolerance, 0.78)
+    # STRICT matching: cap tolerance at 0.55 max to prevent false positives
+    # CNN ingestion already captures angled/profile faces at good encoding quality,
+    # so a stricter comparison threshold is safe and accurate.
+    tolerance = min(max(tolerance, 0.40), 0.55)
     
     temp_selfie_filename = f"reference_{uuid.uuid4().hex}_{os.path.basename(file.filename)}"
     
     try:
         # Upload selfie directly to Cloudinary
         public_url = await asyncio.to_thread(upload_to_cloudinary, content, f"{temp_selfie_filename}.jpg", "temp_selfies")
-            
-        ref_encoding = await asyncio.to_thread(extract_reference_encoding, public_url, model="cnn")
+
+        # Use HOG for selfie — faster, sufficient for single frontal selfie face
+        ref_encoding = await asyncio.to_thread(extract_reference_encoding, public_url, model="hog")
         
+        # STAGE 1 — Broad candidate fetch via pgvector (slightly wider to catch angled poses)
+        BROAD_THRESHOLD = 0.65  # Wider than final tolerance to not miss edge cases
         with get_db() as conn:
             ref_vector_str = str(ref_encoding.tolist())
-            rows = conn.execute(
+            candidate_rows = conn.execute(
                 """
-                SELECT DISTINCT ep.id, ep.file_url 
+                SELECT fe.photo_id, fe.encoding::text AS encoding_str, ep.file_url
                 FROM face_encodings fe
                 JOIN event_photos ep ON fe.photo_id = ep.id
                 WHERE ep.event_id = ? AND ep.faces_scanned = 1
                   AND fe.encoding <-> CAST(? AS vector) <= ?
+                ORDER BY fe.encoding <-> CAST(? AS vector)
                 """,
-                (event_id, ref_vector_str, tolerance)
+                (event_id, ref_vector_str, BROAD_THRESHOLD, ref_vector_str)
             ).fetchall()
-            
-        matched_photos = []
-        for row in rows:
-            matched_photos.append({
-                "id": row["id"],
-                "filename": row["file_url"],
-                "file_id": row["file_url"],
-                "file_url": row["file_url"]
-            })
+
+        # STAGE 2 — Strict Python-level face_recognition verification to eliminate false positives
+        import face_recognition as fr
+        import ast
+        import numpy as np
+
+        def verify_candidates():
+            matched_photos_map = {}  # photo_id -> file_url
+            for row in candidate_rows:
+                photo_id = row["photo_id"]
+                file_url = row["file_url"]
+                enc_str = row["encoding_str"]
+                if not enc_str:
+                    continue
+                try:
+                    enc_arr = np.array(ast.literal_eval(enc_str), dtype=np.float64)
+                except Exception:
+                    continue
+                # Strict comparison at final tolerance — eliminates false positives
+                results = fr.compare_faces([enc_arr], ref_encoding, tolerance=tolerance)
+                if results[0] and photo_id not in matched_photos_map:
+                    matched_photos_map[photo_id] = file_url
+            return matched_photos_map
+
+        matched_map = await asyncio.to_thread(verify_candidates)
+
+        matched_photos = [
+            {"id": pid, "filename": furl, "file_id": furl, "file_url": furl}
+            for pid, furl in matched_map.items()
+        ]
         
         with get_db() as conn:
             metric = "search_success" if matched_photos else "search_fail"
@@ -1503,6 +1552,23 @@ async def download_zip(
                 (event_id,)
             ).fetchall()
         
+    # Check watermark setting for this event
+    with get_db() as conn:
+        wm_row = conn.execute(
+            "SELECT watermark_enabled, name as event_name, owner_username FROM events WHERE id = ?",
+            (event_id,)
+        ).fetchone()
+    watermark_for_zip = wm_row["watermark_enabled"] if wm_row else 0
+    wm_event_name = wm_row["event_name"] if wm_row else ""
+    if wm_row:
+        with get_db() as conn:
+            brand_row = conn.execute(
+                "SELECT name FROM users WHERE username = ?", (wm_row["owner_username"],)
+            ).fetchone()
+        wm_brand_name = brand_row["name"] if brand_row else ""
+    else:
+        wm_brand_name = ""
+
     file_urls = [r["file_url"] for r in rows]
     if not file_urls:
         raise HTTPException(status_code=400, detail="No matching files found for zip download.")
@@ -1512,11 +1578,16 @@ async def download_zip(
         with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
             for idx, url in enumerate(file_urls):
                 try:
-                    resp = requests.get(url, timeout=30.0)
-                    if resp.status_code == 200:
-                        zip_file.writestr(f"photo_{idx}.jpg", resp.content)
-                except Exception:
-                    pass
+                    if watermark_for_zip:
+                        # Apply watermark to each photo before adding to ZIP
+                        wm_buf = _apply_watermark_to_bytes(url, wm_brand_name, wm_event_name)
+                        zip_file.writestr(f"photo_{idx+1}.jpg", wm_buf.read())
+                    else:
+                        resp = requests.get(url, timeout=30.0)
+                        if resp.status_code == 200:
+                            zip_file.writestr(f"photo_{idx+1}.jpg", resp.content)
+                except Exception as zip_ex:
+                    logger.warning(f"Skipped photo {idx+1} in zip: {zip_ex}")
                 
         zip_buffer.seek(0)
         return zip_buffer
