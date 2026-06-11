@@ -98,6 +98,7 @@ def init_db():
                     subscription_expires_at TEXT,
                     processing_priority TEXT DEFAULT 'normal',
                     custom_storage_bytes BIGINT DEFAULT NULL,
+                    parent_username TEXT REFERENCES users(username) ON DELETE CASCADE,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
@@ -124,7 +125,7 @@ def init_db():
                 CREATE TABLE IF NOT EXISTS event_photos (
                     id SERIAL PRIMARY KEY,
                     event_id TEXT NOT NULL REFERENCES events(id) ON DELETE CASCADE,
-                    file_id TEXT NOT NULL,
+                    file_url TEXT NOT NULL,
                     file_size BIGINT DEFAULT 0,
                     faces_scanned INTEGER DEFAULT 0,
                     faces_count INTEGER DEFAULT 0,

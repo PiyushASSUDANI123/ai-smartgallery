@@ -30,3 +30,4 @@ pillow_heif
 pydantic-settings==2.2.1
 qrcode[pil]
 httpx
+cloudinary==1.41.0

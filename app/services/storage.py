@@ -1,10 +1,12 @@
 import os
-import requests
+import cloudinary
+import cloudinary.uploader
 from fastapi import HTTPException, status
 from io import BytesIO
 from PIL import Image
 import pillow_heif
 import logging
+import asyncio
 
 from app.core.config import settings
 
@@ -13,82 +15,83 @@ logger = logging.getLogger("StorageService")
 # Register HEIC opener for PIL
 pillow_heif.register_heif_opener()
 
-import httpx
-import asyncio
+# Configure Cloudinary
+if settings.CLOUDINARY_CLOUD_NAME and settings.CLOUDINARY_API_KEY and settings.CLOUDINARY_API_SECRET:
+    cloudinary.config(
+        cloud_name=settings.CLOUDINARY_CLOUD_NAME,
+        api_key=settings.CLOUDINARY_API_KEY,
+        api_secret=settings.CLOUDINARY_API_SECRET,
+        secure=True
+    )
+else:
+    logger.warning("Cloudinary credentials are not configured. Uploads will fail.")
 
-async def upload_to_telegram(content: bytes, filename: str, event_id: str) -> str:
-    """Uploads a byte string to Telegram Private Channel and returns the file_id."""
-    bot_token = settings.TELEGRAM_BOT_TOKEN
-    channel_id = settings.TELEGRAM_CHANNEL_ID
-    
-    if not bot_token or not channel_id:
-        logger.error("Telegram credentials are not configured.")
-        raise HTTPException(status_code=500, detail="Telegram configuration is missing.")
-        
+def upload_to_cloudinary(content: bytes, filename: str, event_id: str) -> str:
+    """Uploads a byte string directly to Cloudinary and returns the secure URL."""
     try:
-        url = f"https://api.telegram.org/bot{bot_token}/sendDocument"
+        # Construct a folder path based on event_id for organization
+        folder_path = f"gallery_events/{event_id}"
         
-        # Send as document to prevent compression and keep original quality
-        files = {
-            "document": (filename, content, "image/jpeg")
-        }
-        data = {
-            "chat_id": channel_id,
-            "caption": f"Event ID: {event_id} | File: {filename}"
-        }
+        # Cloudinary automatically detects content type, we just pass the bytes
+        response = cloudinary.uploader.upload(
+            content,
+            folder=folder_path,
+            public_id=filename,
+            overwrite=True,
+            resource_type="image"
+        )
         
-        max_retries = 3
-
-        for attempt in range(max_retries):
-            try:
-                # httpx ka async client use karo jo thread block nahi karta
-                async with httpx.AsyncClient(timeout=45.0) as client:
-                    response = await client.post(url, data=data, files=files)
-                    response.raise_for_status()
-                    break # Success
-            except httpx.ReadTimeout:
-                if attempt < max_retries - 1:
-                    logger.warning(f"Telegram upload attempt {attempt + 1} timed out. Retrying...")
-                    await asyncio.sleep(2 ** attempt)
-                else:
-                    logger.error("Telegram API Gateway Timeout.")
-                    raise HTTPException(status_code=504, detail="Telegram API Gateway Timeout. Server is slow.")
-            except Exception as e:
-                if attempt < max_retries - 1:
-                    logger.warning(f"Telegram upload attempt {attempt + 1} failed ({type(e).__name__}): {e}. Retrying...")
-                    await asyncio.sleep(2 ** attempt) # Exponential backoff: 1s, 2s
-                else:
-                    logger.error(f"Telegram upload failed completely after {max_retries} attempts: {type(e).__name__} - {e}")
-                    raise # Rethrow on last attempt
-        
-        resp_data = response.json()
-        if not resp_data.get("ok"):
-            logger.error(f"Telegram upload failed: {resp_data}")
-            raise HTTPException(status_code=500, detail="Failed to upload image to Telegram.")
-            
-        # Extract file_id from document
-        document = resp_data["result"].get("document")
-        if document:
-            return document["file_id"]
-        
-        # Fallback if sent as photo
-        photo = resp_data["result"].get("photo")
-        if photo:
-            return photo[-1]["file_id"]  # Last one is the highest resolution
-            
-        raise HTTPException(status_code=500, detail="Invalid response from Telegram.")
-            
-    except HTTPException:
-        raise
+        # Return the secure public URL
+        return response.get("secure_url")
     except Exception as e:
-        logger.error(f"Failed to upload to Telegram: {e}")
+        logger.error(f"Failed to upload to Cloudinary: {e}")
         raise HTTPException(status_code=500, detail="Failed to upload image to cloud storage.")
+
+async def delete_from_cloudinary(file_url: str) -> bool:
+    """
+    Deletes an image from Cloudinary using its secure URL.
+    Parses the URL to extract the public_id and destroys the asset asynchronously.
+    """
+    if not settings.CLOUDINARY_CLOUD_NAME or not settings.CLOUDINARY_API_KEY or not settings.CLOUDINARY_API_SECRET:
+        logger.warning("Cloudinary credentials not configured, skipping delete.")
+        return False
+        
+    def sync_delete():
+        try:
+            # A typical URL looks like:
+            # https://res.cloudinary.com/<cloud_name>/image/upload/v<version>/<public_id_path>
+            if "image/upload/" not in file_url:
+                logger.warning(f"URL is not a standard Cloudinary image URL: {file_url}")
+                return False
+                
+            parts = file_url.split("image/upload/")
+            path_part = parts[1] # e.g. v1570975253/gallery_events/event1/pic.jpg
+            
+            # Remove version if present (starts with 'v' followed by digits)
+            path_segments = path_part.split("/")
+            if path_segments[0].startswith("v") and path_segments[0][1:].isdigit():
+                path_segments = path_segments[1:]
+                
+            # Reconstruct public_id without extension
+            public_id_with_ext = "/".join(path_segments)
+            public_id = os.path.splitext(public_id_with_ext)[0]
+            
+            logger.info(f"Destroying Cloudinary asset with public_id: {public_id}")
+            response = cloudinary.uploader.destroy(public_id)
+            result = response.get("result")
+            logger.info(f"Cloudinary destroy response: {response}")
+            return result == "ok"
+        except Exception as e:
+            logger.error(f"Failed to delete from Cloudinary: {e}")
+            return False
+
+    return await asyncio.to_thread(sync_delete)
 
 async def process_and_save_uploaded_image(content: bytes, filename: str, event_id: str) -> tuple[str, int]:
     """
     Validates any uploaded image format. If HEIC/HEIF or TIFF,
     converts it to JPEG with high quality (95) on the fly without loss.
-    Uploads the final image to Telegram and returns (file_id, file_size).
+    Uploads the final image to Cloudinary and returns (public_url, file_size).
     """
     safe_base = os.path.splitext(os.path.basename(filename))[0]
     ext = os.path.splitext(filename)[1].lower()
@@ -132,14 +135,13 @@ async def process_and_save_uploaded_image(content: bytes, filename: str, event_i
         else:
             image.close()
             
-        final_filename = f"{safe_base}{final_ext}"
-        return upload_content, final_filename, file_size
+        return upload_content, file_size
 
     # CPU-bound PIL tasks in background thread
-    upload_content, final_filename, file_size = await asyncio.to_thread(process_image_sync)
+    upload_content, file_size = await asyncio.to_thread(process_image_sync)
         
-    # Upload to Telegram (Async)
-    file_id = await upload_to_telegram(upload_content, final_filename, event_id)
-    logger.info(f"Successfully uploaded {filename} to Telegram with file_id: {file_id}")
+    # Upload to Cloudinary (Async wrapper)
+    public_url = await asyncio.to_thread(upload_to_cloudinary, upload_content, safe_base, event_id)
+    logger.info(f"Successfully uploaded {filename} to Cloudinary: {public_url}")
     
-    return file_id, file_size
+    return public_url, file_size

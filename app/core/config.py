@@ -21,6 +21,12 @@ class Settings(BaseSettings):
     TELEGRAM_CHANNEL_ID: str = os.environ.get("TELEGRAM_CHANNEL_ID", "-1003783865322")
     TELEGRAM_PROXY_URL: Optional[str] = os.environ.get("TELEGRAM_PROXY_URL", None)
 
+    # Cloudinary Config
+    CLOUDINARY_CLOUD_NAME: str = os.environ.get("CLOUDINARY_CLOUD_NAME", "")
+    CLOUDINARY_API_KEY: str = os.environ.get("CLOUDINARY_API_KEY", "")
+    CLOUDINARY_API_SECRET: str = os.environ.get("CLOUDINARY_API_SECRET", "")
+
+
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"
