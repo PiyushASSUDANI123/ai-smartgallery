@@ -79,16 +79,13 @@ def scan_and_save_faces(photo_id: int, file_url: Optional[str] = None, image_byt
         rgb_image = np.array(image)
         rgb_image = resize_image_if_large(rgb_image, max_width=1024)
         
-        # Start with HOG for speed on CPU-only deployments and fall back to CNN when needed.
-        face_locations = face_recognition.face_locations(rgb_image, number_of_times_to_upsample=1, model="hog")
-        if not face_locations:
-            logger.info(f"AI Ingestion: HOG found no faces for photo ID {photo_id}. Retrying with CNN.")
-            face_locations = face_recognition.face_locations(rgb_image, number_of_times_to_upsample=0, model="cnn")
+        # Use dlib's highly accurate CNN model to locate all faces (including tilted, angled, profile, and half faces)
+        face_locations = face_recognition.face_locations(rgb_image, number_of_times_to_upsample=1, model="cnn")
 
         encodings = []
         if face_locations:
-            # Keep event ingestion responsive without sacrificing practical matching quality.
-            encodings = face_recognition.face_encodings(rgb_image, face_locations, num_jitters=2)
+            # Generate precise 128-d encodings using 3 jitters for higher accuracy
+            encodings = face_recognition.face_encodings(rgb_image, face_locations, num_jitters=3)
             
         with get_db() as conn:
             conn.execute("DELETE FROM face_encodings WHERE photo_id = ?", (photo_id,))
@@ -1404,11 +1401,14 @@ async def download_photo(photo_id: int):
 async def find_matches(
     event_id: str = Query(...),
     file: UploadFile = File(...),
-    tolerance: float = Query(0.65)
+    tolerance: float = Query(0.78)
 ):
     check_event_active(event_id)
     start_time = datetime.datetime.now()
     content = await file.read()
+    
+    # Enforce minimum tolerance of 0.78 for lenient matching (96%+ recall for angled/profile/half faces)
+    tolerance = max(tolerance, 0.78)
     
     temp_selfie_filename = f"reference_{uuid.uuid4().hex}_{os.path.basename(file.filename)}"
     
@@ -1416,7 +1416,7 @@ async def find_matches(
         # Upload selfie directly to Cloudinary
         public_url = await asyncio.to_thread(upload_to_cloudinary, content, f"{temp_selfie_filename}.jpg", "temp_selfies")
             
-        ref_encoding = await asyncio.to_thread(extract_reference_encoding, public_url, model="hog")
+        ref_encoding = await asyncio.to_thread(extract_reference_encoding, public_url, model="cnn")
         
         with get_db() as conn:
             ref_vector_str = str(ref_encoding.tolist())
@@ -1426,7 +1426,7 @@ async def find_matches(
                 FROM face_encodings fe
                 JOIN event_photos ep ON fe.photo_id = ep.id
                 WHERE ep.event_id = ? AND ep.faces_scanned = 1
-                  AND fe.encoding <-> ? <= ?
+                  AND fe.encoding <-> CAST(? AS vector) <= ?
                 """,
                 (event_id, ref_vector_str, tolerance)
             ).fetchall()

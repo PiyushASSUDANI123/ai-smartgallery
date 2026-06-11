@@ -52,12 +52,7 @@ def load_image_rgb(image_path: str) -> np.ndarray:
         FaceRecognitionError: If the image cannot be decoded or loaded.
     """
     if not image_path.startswith("http") and not os.path.isfile(image_path):
-        # Assume it's a Telegram file_id
-        from app.services.telegram_helpers import get_telegram_file_url
-        try:
-            image_path = get_telegram_file_url(image_path)
-        except Exception as e:
-            raise FileNotFoundError(f"Failed to resolve Telegram file_id '{image_path}': {e}")
+        raise FileNotFoundError(f"Image path does not exist and is not a URL: '{image_path}'")
 
     if image_path.startswith("http"):
         import requests
@@ -153,8 +148,8 @@ def extract_reference_encoding(image_path: str, model: str = "hog") -> np.ndarra
         # A selfie should ideally only contain the target user's face.
         logger.warning(f"Multiple faces ({num_faces}) detected in reference image. Using the first detected face.")
 
-    # Keep reference encoding responsive for API use while preserving accuracy.
-    encodings = face_recognition.face_encodings(rgb_image, face_locations, num_jitters=4)
+    # Generate highly robust reference face encoding using 15 jitters for maximum accuracy
+    encodings = face_recognition.face_encodings(rgb_image, face_locations, num_jitters=15)
     if not encodings:
         del rgb_image
         del face_locations
