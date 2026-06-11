@@ -15,6 +15,7 @@ from PIL import Image
 import pillow_heif
 import requests
 import psycopg2
+import qrcode
 from io import BytesIO
 
 # Register HEIC opener for PIL
@@ -1001,8 +1002,7 @@ async def get_event_analytics(event_id: str):
 @router.get("/events/{event_id}/qr")
 async def get_event_qr(event_id: str, client_url: str = Query(None)):
     check_event_active(event_id)
-    import qrcode
-    
+
     with get_db() as conn:
         row = conn.execute("SELECT name, pin FROM events WHERE id = ?", (event_id,)).fetchone()
     if not row:
