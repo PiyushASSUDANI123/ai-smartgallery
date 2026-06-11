@@ -153,8 +153,8 @@ def extract_reference_encoding(image_path: str, model: str = "hog") -> np.ndarra
         # A selfie should ideally only contain the target user's face.
         logger.warning(f"Multiple faces ({num_faces}) detected in reference image. Using the first detected face.")
 
-    # Generate highly robust encodings for the reference face
-    encodings = face_recognition.face_encodings(rgb_image, face_locations, num_jitters=100)
+    # Keep reference encoding responsive for API use while preserving accuracy.
+    encodings = face_recognition.face_encodings(rgb_image, face_locations, num_jitters=4)
     if not encodings:
         del rgb_image
         del face_locations
@@ -212,8 +212,8 @@ def process_single_event_image(
             logger.debug(f"No faces detected in event photo: {image_path}")
             return None
 
-        # Extract 128-d encodings using multiple jitters for high precision
-        face_encodings = face_recognition.face_encodings(rgb_image, face_locations, num_jitters=10)
+        # Lower jitters keeps bulk event scans practical on CPU-only local setups.
+        face_encodings = face_recognition.face_encodings(rgb_image, face_locations, num_jitters=2)
         
         # Compare each face encoding to the reference encoding
         matches = face_recognition.compare_faces(face_encodings, reference_encoding, tolerance=tolerance)

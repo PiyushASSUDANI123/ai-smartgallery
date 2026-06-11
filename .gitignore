@@ -1,0 +1,17 @@
+__pycache__/
+venv/
+.env
+.pytest_cache/
+*.pyc
+*.db
+*.bak
+*.bak2
+.DS_Store
+._*
+cleanup_db.py
+cleanup_pending.py
+fix_db.py
+migrate_pgvector.py
+test_db.py
+test_pgvector.py
+test_telegram.py

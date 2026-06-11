@@ -14,6 +14,9 @@ def get_telegram_file_url(file_id: str) -> str:
     if not bot_token:
         logger.error("TELEGRAM_BOT_TOKEN is missing")
         raise HTTPException(status_code=500, detail="Telegram configuration is missing.")
+
+    if not file_id or file_id == "pending_upload":
+        raise HTTPException(status_code=404, detail="Photo is still processing. Please try again shortly.")
         
     if file_id.startswith("http://") or file_id.startswith("https://"):
         logger.info(f"Legacy Cloudinary URL detected, skipping Telegram API: {file_id}")
@@ -21,11 +24,11 @@ def get_telegram_file_url(file_id: str) -> str:
         
     try:
         proxies = None
-        if hasattr(settings, 'TELEGRAM_PROXY_URL') and settings.TELEGRAM_PROXY_URL:
-            proxies = {
-                "http": settings.TELEGRAM_PROXY_URL,
-                "https": settings.TELEGRAM_PROXY_URL
-            }
+        # if hasattr(settings, 'TELEGRAM_PROXY_URL') and settings.TELEGRAM_PROXY_URL:
+        #     proxies = {
+        #         "http": settings.TELEGRAM_PROXY_URL,
+        #         "https": settings.TELEGRAM_PROXY_URL
+        #     }
 
         url = f"https://api.telegram.org/bot{bot_token}/getFile?file_id={file_id}"
         response = requests.get(url, timeout=30.0, proxies=proxies)
@@ -39,6 +42,8 @@ def get_telegram_file_url(file_id: str) -> str:
         file_path = data["result"]["file_path"]
         download_url = f"https://api.telegram.org/file/bot{bot_token}/{file_path}"
         return download_url
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error fetching file from Telegram: {e}")
         raise HTTPException(status_code=500, detail="Error fetching file from Telegram.")

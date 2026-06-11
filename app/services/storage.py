@@ -38,17 +38,11 @@ async def upload_to_telegram(content: bytes, filename: str, event_id: str) -> st
         }
         
         max_retries = 3
-        
-        proxies = None
-        if hasattr(settings, 'TELEGRAM_PROXY_URL') and settings.TELEGRAM_PROXY_URL:
-            proxies = {
-                "all://": settings.TELEGRAM_PROXY_URL
-            }
 
         for attempt in range(max_retries):
             try:
                 # httpx ka async client use karo jo thread block nahi karta
-                async with httpx.AsyncClient(proxies=proxies, timeout=45.0) as client:
+                async with httpx.AsyncClient(timeout=45.0) as client:
                     response = await client.post(url, data=data, files=files)
                     response.raise_for_status()
                     break # Success
@@ -84,6 +78,8 @@ async def upload_to_telegram(content: bytes, filename: str, event_id: str) -> st
             
         raise HTTPException(status_code=500, detail="Invalid response from Telegram.")
             
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Failed to upload to Telegram: {e}")
         raise HTTPException(status_code=500, detail="Failed to upload image to cloud storage.")

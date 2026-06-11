@@ -56,33 +56,42 @@ def shutdown_event():
 
 # --- BACKGROUND AI PROCESSING ---
 
-def scan_and_save_faces(photo_id: int, file_id: str):
+def scan_and_save_faces(photo_id: int, file_id: Optional[str] = None, image_bytes: Optional[bytes] = None):
     import face_recognition
     try:
-        from app.services.face_recognition import load_image_rgb, resize_image_if_large
+        from app.services.face_recognition import resize_image_if_large
         from io import BytesIO
         import requests
         import numpy as np
         from PIL import Image
         
-        # Download image from Telegram
-        download_url = get_telegram_file_url(file_id)
-        response = requests.get(download_url)
-        response.raise_for_status()
+        if image_bytes is None:
+            if not file_id:
+                raise ValueError("Either file_id or image_bytes must be provided for face scanning.")
+
+            # Fall back to Telegram download for older pending rows only.
+            download_url = get_telegram_file_url(file_id)
+            response = requests.get(download_url, timeout=30.0)
+            response.raise_for_status()
+            image_bytes = response.content
         
-        image = Image.open(BytesIO(response.content))
+        image = Image.open(BytesIO(image_bytes))
         if image.mode != "RGB":
             image = image.convert("RGB")
             
         rgb_image = np.array(image)
         rgb_image = resize_image_if_large(rgb_image, max_width=1024)
         
-        # CNN model is heavily optimized for side-poses and extreme angles
-        face_locations = face_recognition.face_locations(rgb_image, number_of_times_to_upsample=1, model="cnn")
+        # Start with HOG for speed on CPU-only deployments and fall back to CNN when needed.
+        face_locations = face_recognition.face_locations(rgb_image, number_of_times_to_upsample=1, model="hog")
+        if not face_locations:
+            logger.info(f"AI Ingestion: HOG found no faces for photo ID {photo_id}. Retrying with CNN.")
+            face_locations = face_recognition.face_locations(rgb_image, number_of_times_to_upsample=0, model="cnn")
+
         encodings = []
         if face_locations:
-            # High jitters for maximum robustness (lenient/powerful matching)
-            encodings = face_recognition.face_encodings(rgb_image, face_locations, num_jitters=10)
+            # Keep event ingestion responsive without sacrificing practical matching quality.
+            encodings = face_recognition.face_encodings(rgb_image, face_locations, num_jitters=2)
             
         with get_db() as conn:
             conn.execute("DELETE FROM face_encodings WHERE photo_id = ?", (photo_id,))
@@ -1098,6 +1107,8 @@ async def upload_event_photos(
                 await asyncio.sleep(0.5)
             try:
                 if get_admin_storage_used(owner_usr) >= max_stor:
+                    with get_db() as conn:
+                        conn.execute("DELETE FROM event_photos WHERE id = ?", (photo_id,))
                     return None
                 
                 # Process the image, save it, and get file_id and size
@@ -1113,9 +1124,13 @@ async def upload_event_photos(
                         """,
                         (public_url, file_size, photo_id)
                     )
-                    return {"id": photo_id, "file_id": public_url}
+                # Scan the uploaded bytes directly to avoid a second Telegram download.
+                await asyncio.to_thread(scan_and_save_faces, photo_id, public_url, content)
+                return {"id": photo_id, "file_id": public_url}
             except Exception as e:
                 logger.error(f"Failed saving uploaded file {filename}: {e}")
+                with get_db() as conn:
+                    conn.execute("DELETE FROM event_photos WHERE id = ?", (photo_id,))
                 return None
 
         tasks = [process_single(fn, c, ct, pid) for fn, c, ct, pid in files_data]
@@ -1148,8 +1163,8 @@ async def upgrade_photo_res(
     content = await file.read()
     
     try:
-        public_url, file_size = await asyncio.to_thread(
-            process_and_save_uploaded_image, content, file.filename, event_id
+        public_url, file_size = await process_and_save_uploaded_image(
+            content, file.filename, event_id
         )
     except Exception as e:
         logger.error(f"Failed to upgrade photo {photo_id}: {e}")
@@ -1383,7 +1398,7 @@ async def find_matches(
         # Upload selfie directly to Telegram
         public_url = await upload_to_telegram(content, f"{temp_selfie_filename}.jpg", "temp_selfies")
             
-        ref_encoding = await asyncio.to_thread(extract_reference_encoding, public_url, model="cnn")
+        ref_encoding = await asyncio.to_thread(extract_reference_encoding, public_url, model="hog")
         
         with get_db() as conn:
             ref_vector_str = str(ref_encoding.tolist())
@@ -1427,6 +1442,8 @@ async def find_matches(
         duration = int((datetime.datetime.now() - start_time).total_seconds() * 1000)
         log_audit_action("guest", f"face_match (event: {event_id})", duration, len(content), "failed (no face)")
         raise HTTPException(status_code=400, detail=str(fre))
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Matching error: {e}", exc_info=True)
         duration = int((datetime.datetime.now() - start_time).total_seconds() * 1000)
@@ -1467,7 +1484,7 @@ async def download_zip(
             ).fetchall()
         
     file_ids = [r["file_id"] for r in rows]
-    if not filenames:
+    if not file_ids:
         raise HTTPException(status_code=400, detail="No matching files found for zip download.")
         
     def build_zip() -> BytesIO:
