@@ -1287,6 +1287,7 @@ def _apply_watermark_to_bytes(file_url: str, brand_name: str, event_name: str) -
     """
     Downloads the image from `file_url`, applies a diagonal semi-transparent watermark
     overlay (brand + event name), and returns a BytesIO of the result as JPEG.
+    The watermark uses dark text with a light outline for visibility on ALL backgrounds.
     """
     from PIL import Image, ImageDraw, ImageFont
     import requests
@@ -1303,20 +1304,29 @@ def _apply_watermark_to_bytes(file_url: str, brand_name: str, event_name: str) -
     w, h = image.size
     watermark_str = f"{brand_name.upper()} • {event_name.upper()}"
 
+    font_size = max(18, int(w / 28))
     try:
-        font = ImageFont.truetype("arial.ttf", max(14, int(w / 35)))
+        font = ImageFont.truetype("arial.ttf", font_size)
     except IOError:
         try:
-            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", max(14, int(w / 35)))
+            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", font_size)
         except IOError:
-            font = ImageFont.load_default()
+            try:
+                font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", font_size)
+            except IOError:
+                font = ImageFont.load_default()
 
     # Diagonal repeating watermark grid
-    step_x = max(int(w / 2.5), 200)
-    step_y = max(int(h / 4), 150)
-    for x in range(30, w + step_x, step_x):
-        for y in range(30, h + step_y, step_y):
-            d.text((x, y), watermark_str, fill=(255, 255, 255, 45), font=font)
+    step_x = max(int(w / 2.2), 250)
+    step_y = max(int(h / 3.5), 160)
+    
+    for x in range(-50, w + step_x, step_x):
+        for y in range(-50, h + step_y, step_y):
+            # Draw dark outline/shadow for readability on light backgrounds
+            shadow_offset = max(1, font_size // 12)
+            d.text((x + shadow_offset, y + shadow_offset), watermark_str, fill=(0, 0, 0, 90), font=font)
+            # Draw main watermark text in white with good opacity
+            d.text((x, y), watermark_str, fill=(255, 255, 255, 110), font=font)
 
     watermarked = Image.alpha_composite(image, txt)
     rgb_im = watermarked.convert("RGB")
