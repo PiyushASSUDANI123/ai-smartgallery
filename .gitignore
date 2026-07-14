@@ -1,13 +1,39 @@
-__pycache__/
-venv/
+# Environments
 .env
-.pytest_cache/
-*.pyc
-*.db
-*.bak
-*.bak2
+venv/
+.venv/
+env/
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS generated files
 .DS_Store
 ._*
+.Spotlight-V100
+.Trashes
+
+# Local Database & Backups
+*.db
+*.sqlite3
+*.bak
+*.bak2
+
+# Pytest / Coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Project specific scripts to ignore
 cleanup_db.py
 cleanup_pending.py
 fix_db.py

@@ -1,9 +1,45 @@
-venv/
+# Environments
 .env
+venv/
+.venv/
+env/
+
+# Git
+.git/
+.gitignore
+
+# Byte-compiled files
 __pycache__/
-*.db
-*.pyc
-*.bak
-*.bak2
+*.py[cod]
+*$py.class
+*.so
+
+# IDEs
+.vscode/
+.idea/
+
+# OS generated files
 .DS_Store
 ._*
+
+# Local Database & Backups
+*.db
+*.sqlite3
+*.bak
+*.bak2
+
+# Docker
+Dockerfile
+.dockerignore
+
+# Pytest / Coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Scripts to exclude from prod container
+cleanup_db.py
+cleanup_pending.py
+fix_db.py
+migrate_pgvector.py
+test_*.py
