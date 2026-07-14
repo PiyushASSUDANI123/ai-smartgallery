@@ -370,18 +370,56 @@ def check_photo_active(photo_id: int):
 
 # --- AUTHENTICATION & TEAM MANAGEMENT (RBAC) ---
 @router.post("/login")
-async def login(username: str = Query(...), password: str = Query(...)):
+async def login(request: Request, username: str = Query(...), password: str = Query(...)):
+    ip_address = request.client.host if request.client else "unknown"
     hashed = hash_password(password)
+    
     with get_db() as conn:
+        # Check if IP is blocked
+        blocked = conn.execute(
+            "SELECT blocked_until FROM blocked_ips WHERE ip_address = ? AND blocked_until > CURRENT_TIMESTAMP",
+            (ip_address,)
+        ).fetchone()
+        
+        if blocked:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN, 
+                detail="Too many failed login attempts. Your IP has been temporarily blocked."
+            )
+
         row = conn.execute(
             "SELECT role, name, status, parent_username FROM users WHERE username = ? AND password_hash = ?",
             (username, hashed)
         ).fetchone()
         
-    if not row:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid username or password credentials."
+        if not row:
+            # Failed login attempt
+            conn.execute(
+                "INSERT INTO login_attempts (ip_address, username_attempted, status) VALUES (?, ?, 'failed')",
+                (ip_address, username)
+            )
+            
+            # Check threshold (10 fails in last hour)
+            recent_fails = conn.execute(
+                "SELECT COUNT(*) as count FROM login_attempts WHERE ip_address = ? AND status = 'failed' AND timestamp > CURRENT_TIMESTAMP - INTERVAL '1 hour'",
+                (ip_address,)
+            ).fetchone()
+            
+            if recent_fails and recent_fails['count'] >= 10:
+                conn.execute(
+                    "INSERT INTO blocked_ips (ip_address, blocked_until, reason) VALUES (?, CURRENT_TIMESTAMP + INTERVAL '1 hour', 'Brute force protection') ON CONFLICT(ip_address) DO UPDATE SET blocked_until = CURRENT_TIMESTAMP + INTERVAL '1 hour'",
+                    (ip_address,)
+                )
+                
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid username or password credentials."
+            )
+            
+        # Success login attempt
+        conn.execute(
+            "INSERT INTO login_attempts (ip_address, username_attempted, status) VALUES (?, ?, 'success')",
+            (ip_address, username)
         )
         
     if row["status"] == "suspended":
@@ -744,6 +782,69 @@ async def superadmin_deactivate_broadcast():
     with get_db() as conn:
         conn.execute("UPDATE broadcasts SET active = 0")
     return {"status": "success", "message": "System broadcast deactivated."}
+
+@router.get("/superadmin/crm")
+async def get_crm_data():
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT username, name, status, subscription_price_inr, subscription_duration_months, subscription_expires_at, created_at FROM users WHERE role IN ('owner', 'junior')"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+from datetime import datetime, timedelta
+@router.post("/superadmin/crm/update")
+async def update_crm_data(
+    username: str = Query(...), 
+    price: int = Query(...), 
+    duration_months: int = Query(...)
+):
+    with get_db() as conn:
+        user = conn.execute("SELECT created_at FROM users WHERE username = ?", (username,)).fetchone()
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        # Calculate new expiry based on current date + months
+        new_expiry = (datetime.now() + timedelta(days=30 * duration_months)).strftime("%Y-%m-%d")
+        
+        conn.execute(
+            "UPDATE users SET subscription_price_inr = ?, subscription_duration_months = ?, subscription_expires_at = ? WHERE username = ?",
+            (price, duration_months, new_expiry, username)
+        )
+    return {"status": "success", "message": f"Updated CRM data for {username}"}
+
+@router.get("/superadmin/security/logins")
+async def get_security_logins():
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT id, ip_address, username_attempted, status, timestamp FROM login_attempts ORDER BY timestamp DESC LIMIT 100"
+        ).fetchall()
+        
+        # Format the timestamp so it works with JSON serialization nicely
+        result = []
+        for r in rows:
+            d = dict(r)
+            if hasattr(d['timestamp'], 'isoformat'):
+                d['timestamp'] = d['timestamp'].isoformat()
+            result.append(d)
+        return result
+
+@router.get("/superadmin/security/blocked-ips")
+async def get_security_blocked_ips():
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT id, ip_address, blocked_until, reason, created_at FROM blocked_ips ORDER BY blocked_until DESC"
+        ).fetchall()
+        
+        result = []
+        for r in rows:
+            d = dict(r)
+            if hasattr(d['blocked_until'], 'isoformat'):
+                d['blocked_until'] = d['blocked_until'].isoformat()
+            if hasattr(d['created_at'], 'isoformat'):
+                d['created_at'] = d['created_at'].isoformat()
+            result.append(d)
+        return result
+
 
 @router.get("/broadcast/active")
 async def get_active_broadcast():

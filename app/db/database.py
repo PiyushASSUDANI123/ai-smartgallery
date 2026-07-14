@@ -96,6 +96,8 @@ def init_db():
                     plan_name TEXT DEFAULT 'Basic',
                     allocated_storage_bytes BIGINT DEFAULT 53687091200,
                     subscription_expires_at TEXT,
+                    subscription_price_inr INTEGER DEFAULT 0,
+                    subscription_duration_months INTEGER DEFAULT 1,
                     processing_priority TEXT DEFAULT 'normal',
                     custom_storage_bytes BIGINT DEFAULT NULL,
                     parent_username TEXT REFERENCES users(username) ON DELETE CASCADE,
@@ -212,6 +214,26 @@ def init_db():
                 )
             """)
 
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS login_attempts (
+                    id SERIAL PRIMARY KEY,
+                    ip_address TEXT NOT NULL,
+                    username_attempted TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK(status IN ('success', 'failed')),
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS blocked_ips (
+                    id SERIAL PRIMARY KEY,
+                    ip_address TEXT UNIQUE NOT NULL,
+                    blocked_until TIMESTAMP NOT NULL,
+                    reason TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
             # --- PERFORMANCE OPTIMIZATION: B-Tree Indexes ---
             logger.info("Creating B-Tree Indexes for rapid lookups...")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_events_owner ON events(owner_username);")
@@ -220,6 +242,7 @@ def init_db():
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_analytics_event ON analytics(event_id);")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_matches_lead ON matches(lead_id);")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_matches_event ON matches(event_id);")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_login_attempts_ip ON login_attempts(ip_address);")
 
             cursor.execute("SELECT COUNT(*) FROM users")
             user_count = cursor.fetchone()[0]
