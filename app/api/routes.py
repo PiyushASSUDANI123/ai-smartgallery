@@ -11,7 +11,7 @@ from fastapi import FastAPI, UploadFile, File, Query, HTTPException, status, Bac
 from fastapi.responses import JSONResponse, StreamingResponse, FileResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from PIL import Image
+from PIL import Image, ImageOps
 import pillow_heif
 import requests
 import psycopg2
@@ -74,11 +74,15 @@ def scan_and_save_faces(photo_id: int, file_url: Optional[str] = None, image_byt
             image_bytes = response.content
         
         image = Image.open(BytesIO(image_bytes))
+        # Fix EXIF orientation (e.g. mobile photos rotated sideways)
+        image = ImageOps.exif_transpose(image)
+        
         if image.mode != "RGB":
             image = image.convert("RGB")
             
         rgb_image = np.array(image)
-        rgb_image = resize_image_if_large(rgb_image, max_width=1280)
+        # Downscale more aggressively (1024px instead of 1280px) for ~50% faster CNN speed
+        rgb_image = resize_image_if_large(rgb_image, max_width=1024)
         
         # PRIMARY: CNN model — detects tilted, angled, profile, and partially occluded faces
         face_locations = face_recognition.face_locations(rgb_image, number_of_times_to_upsample=1, model="cnn")
@@ -88,8 +92,8 @@ def scan_and_save_faces(photo_id: int, file_url: Optional[str] = None, image_byt
 
         encodings = []
         if face_locations:
-            # 2 jitters: fast enough for bulk ingestion, precise enough for strict matching
-            encodings = face_recognition.face_encodings(rgb_image, face_locations, num_jitters=2)
+            # 3 jitters: Highly robust 3D-like encoding precision
+            encodings = face_recognition.face_encodings(rgb_image, face_locations, num_jitters=3)
             
         with get_db() as conn:
             conn.execute("DELETE FROM face_encodings WHERE photo_id = ?", (photo_id,))
@@ -1221,6 +1225,15 @@ async def list_event_photos(event_id: str, selected_only: bool = Query(False)):
             d = dict(r)
             if "file_url" in d:
                 d["file_id"] = d["file_url"]
+                
+                # Generate optimized thumbnail for gallery display
+                original_url = d["file_url"]
+                if original_url and "res.cloudinary.com" in original_url and "/upload/" in original_url:
+                    parts = original_url.split("/upload/")
+                    d["thumbnail_url"] = parts[0] + "/upload/c_limit,w_600,q_auto,f_auto/" + parts[1]
+                else:
+                    d["thumbnail_url"] = original_url
+                    
             results.append(d)
         return results
 
@@ -1440,9 +1453,15 @@ async def download_photo(photo_id: int):
             return StreamingResponse(buffer, media_type="image/jpeg", headers=download_headers)
         except Exception as e:
             logger.error(f"Watermark failed on download for photo {photo_id}: {e}")
-            # Fall through to stream without watermark
+            # Fall through to redirect without watermark
 
-    # Stream original bytes with download header (no redirect — fixes CORS in Flutter)
+    # Fast redirect to Cloudinary with attachment flag (zero backend memory used)
+    if "res.cloudinary.com" in file_url and "/upload/" in file_url:
+        parts = file_url.split("/upload/")
+        download_url = parts[0] + f"/upload/fl_attachment:photo_{photo_id}/" + parts[1]
+        return RedirectResponse(url=download_url)
+    
+    # Fallback for non-cloudinary URLs
     try:
         resp = await asyncio.to_thread(lambda: requests.get(file_url, timeout=30.0))
         resp.raise_for_status()
@@ -1454,6 +1473,7 @@ async def download_photo(photo_id: int):
 # --- DUAL-SIDE FACE SEARCH MECHANICS ---
 @router.post("/find-matches", response_class=JSONResponse)
 async def find_matches(
+    background_tasks: BackgroundTasks,
     event_id: str = Query(...),
     file: UploadFile = File(...),
     tolerance: float = Query(0.52)
@@ -1468,13 +1488,22 @@ async def find_matches(
     tolerance = min(max(tolerance, 0.40), 0.55)
     
     temp_selfie_filename = f"reference_{uuid.uuid4().hex}_{os.path.basename(file.filename)}"
+    temp_file_path = f"/tmp/{temp_selfie_filename}.jpg"
     
     try:
-        # Upload selfie directly to Cloudinary
-        public_url = await asyncio.to_thread(upload_to_cloudinary, content, f"{temp_selfie_filename}.jpg", "temp_selfies")
-
-        # Use HOG for selfie — faster, sufficient for single frontal selfie face
-        ref_encoding = await asyncio.to_thread(extract_reference_encoding, public_url, model="hog")
+        # Save locally for instant face recognition
+        with open(temp_file_path, "wb") as f:
+            f.write(content)
+            
+        # Extract encoding immediately from local file (CNN is used for maximum baseline accuracy)
+        ref_encoding = await asyncio.to_thread(extract_reference_encoding, temp_file_path, model="cnn")
+        
+        # Cleanup temp file immediately
+        if os.path.exists(temp_file_path):
+            os.remove(temp_file_path)
+            
+        # Upload selfie to Cloudinary asynchronously
+        background_tasks.add_task(upload_to_cloudinary, content, f"{temp_selfie_filename}.jpg", "temp_selfies")
         
         # STAGE 1 — Broad candidate fetch via pgvector (slightly wider to catch angled poses)
         BROAD_THRESHOLD = 0.65  # Wider than final tolerance to not miss edge cases

@@ -12,6 +12,8 @@ via multiprocessing to run face detection in parallel across CPU cores.
 import os
 import cv2
 import numpy as np
+from PIL import Image, ImageOps
+from io import BytesIO
 import logging
 import argparse
 import face_recognition
@@ -54,30 +56,22 @@ def load_image_rgb(image_path: str) -> np.ndarray:
     if not image_path.startswith("http") and not os.path.isfile(image_path):
         raise FileNotFoundError(f"Image path does not exist and is not a URL: '{image_path}'")
 
-    if image_path.startswith("http"):
-        import requests
-        import numpy as np
-        resp = requests.get(image_path, timeout=30.0)
-        resp.raise_for_status()
-        nparr = np.frombuffer(resp.content, np.uint8)
-        image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        if image is None:
-            raise FaceRecognitionError(f"OpenCV failed to decode the URL image: '{image_path}'")
-        rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        return rgb_image
-
-    if not os.path.isfile(image_path):
-        raise FileNotFoundError(f"Image path does not exist: '{image_path}'")
-
     try:
-        # Read the image using OpenCV
-        image = cv2.imread(image_path)
-        if image is None:
-            raise FaceRecognitionError(f"OpenCV failed to decode the image: '{image_path}'")
+        if image_path.startswith("http"):
+            import requests
+            resp = requests.get(image_path, timeout=30.0)
+            resp.raise_for_status()
+            image = Image.open(BytesIO(resp.content))
+        else:
+            image = Image.open(image_path)
+            
+        # Fix EXIF orientation (e.g., mobile photos rotated sideways)
+        image = ImageOps.exif_transpose(image)
         
-        # OpenCV loads in BGR; face_recognition expects RGB.
-        rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        return rgb_image
+        if image.mode != "RGB":
+            image = image.convert("RGB")
+            
+        return np.array(image)
     except Exception as e:
         if not isinstance(e, (FileNotFoundError, FaceRecognitionError)):
             raise FaceRecognitionError(f"Error loading image '{image_path}': {str(e)}") from e
