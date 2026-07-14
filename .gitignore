@@ -40,4 +40,3 @@ fix_db.py
 migrate_pgvector.py
 test_db.py
 test_pgvector.py
-test_telegram.py
