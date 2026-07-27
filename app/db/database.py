@@ -105,6 +105,13 @@ def init_db():
                 )
             """)
 
+            # Add new branding columns safely
+            try:
+                cursor.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS brand_name TEXT;")
+                cursor.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS brand_logo_url TEXT;")
+            except Exception as e:
+                logger.error(f"Failed to add new columns to users: {e}")
+
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS events (
                     id TEXT PRIMARY KEY,

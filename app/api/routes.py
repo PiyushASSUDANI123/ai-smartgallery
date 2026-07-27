@@ -388,7 +388,7 @@ async def login(request: Request, username: str = Query(...), password: str = Qu
             )
 
         row = conn.execute(
-            "SELECT role, name, status, parent_username FROM users WHERE username = ? AND password_hash = ?",
+            "SELECT role, name, status, parent_username, brand_name, brand_logo_url FROM users WHERE username = ? AND password_hash = ?",
             (username, hashed)
         ).fetchone()
         
@@ -433,8 +433,54 @@ async def login(request: Request, username: str = Query(...), password: str = Qu
         "username": username,
         "role": row["role"],
         "name": row["name"],
-        "parent_username": row["parent_username"]
+        "parent_username": row["parent_username"],
+        "brand_name": row["brand_name"],
+        "brand_logo_url": row["brand_logo_url"]
     }
+
+@router.post("/update-profile")
+async def update_profile(
+    username: str = Query(...),
+    brand_name: Optional[str] = Query(None),
+    brand_logo_url: Optional[str] = Query(None)
+):
+    with get_db() as conn:
+        user = conn.execute("SELECT id FROM users WHERE username = ?", (username,)).fetchone()
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+            
+        updates = []
+        params = []
+        if brand_name is not None:
+            updates.append("brand_name = ?")
+            params.append(brand_name)
+        if brand_logo_url is not None:
+            updates.append("brand_logo_url = ?")
+            params.append(brand_logo_url)
+            
+        if not updates:
+            return {"status": "success", "message": "No changes requested"}
+            
+        params.append(username)
+        conn.execute(f"UPDATE users SET {', '.join(updates)} WHERE username = ?", tuple(params))
+        
+    return {"status": "success", "message": "Profile updated successfully"}
+
+@router.post("/upload-brand-logo")
+async def upload_brand_logo(
+    username: str = Form(...),
+    file: UploadFile = File(...)
+):
+    ext = os.path.splitext(file.filename)[1].lower()
+    if ext not in {".png", ".jpg", ".jpeg", ".webp"}:
+        raise HTTPException(status_code=400, detail="Unsupported logo image format.")
+        
+    content = await file.read()
+    public_url = await asyncio.to_thread(upload_to_cloudinary, content, f"{username}_brand_logo", "brand_logos")
+        
+    with get_db() as conn:
+        conn.execute("UPDATE users SET brand_logo_url = ? WHERE username = ?", (public_url, username))
+    return {"status": "success", "logo_url": public_url}
 
 @router.get("/users")
 async def list_users(owner_username: Optional[str] = Query(None)):
@@ -604,6 +650,10 @@ async def superadmin_get_stats():
         ev_row = conn.execute("SELECT COUNT(*) as cnt FROM events").fetchone()
         alloc_row = conn.execute("SELECT SUM(allocated_storage_bytes) as total FROM users WHERE role = 'owner'").fetchone()
         
+        # System-wide analytics
+        total_views_row = conn.execute("SELECT COUNT(*) as cnt FROM analytics WHERE metric_type = 'qr_scan'").fetchone()
+        total_downloads_row = conn.execute("SELECT COUNT(*) as cnt FROM analytics WHERE metric_type IN ('download_photo', 'download_zip')").fetchone()
+        
     total_bytes = get_total_storage_used()
     allocated_bytes = alloc_row["total"] if alloc_row and alloc_row["total"] else 0
     
@@ -612,7 +662,9 @@ async def superadmin_get_stats():
         "total_events": ev_row["cnt"] if ev_row else 0,
         "total_allocated_gb": round(allocated_bytes / (1024**3), 1),
         "total_consumed_gb": round(total_bytes / (1024**3), 3),
-        "total_consumed_mb": round(total_bytes / (1024*1024), 2)
+        "total_consumed_mb": round(total_bytes / (1024*1024), 2),
+        "total_views": total_views_row["cnt"] if total_views_row else 0,
+        "total_downloads": total_downloads_row["cnt"] if total_downloads_row else 0
     }
 
 
@@ -644,8 +696,9 @@ async def superadmin_get_admin_xray(username: str):
             p_count = conn.execute("SELECT COUNT(*) as cnt FROM event_photos WHERE event_id = ?", (ev["id"],)).fetchone()["cnt"]
             # Storage used by event
             used_bytes = conn.execute("SELECT SUM(file_size) as total FROM event_photos WHERE event_id = ?", (ev["id"],)).fetchone()["total"] or 0
-            # Guest traffic analytics (scans)
+            # Guest traffic analytics (views & downloads)
             scans_count = conn.execute("SELECT COUNT(*) as cnt FROM analytics WHERE event_id = ? AND metric_type = 'qr_scan'", (ev["id"],)).fetchone()["cnt"]
+            downloads_count = conn.execute("SELECT COUNT(*) as cnt FROM analytics WHERE event_id = ? AND metric_type IN ('download_photo', 'download_zip')", (ev["id"],)).fetchone()["cnt"]
             # Lead capture count
             leads_count = conn.execute("SELECT COUNT(*) as cnt FROM leads WHERE event_id = ?", (ev["id"],)).fetchone()["cnt"]
             
@@ -661,6 +714,7 @@ async def superadmin_get_admin_xray(username: str):
                 "photos_count": p_count,
                 "storage_mb": round(used_bytes / (1024*1024), 2),
                 "scans_count": scans_count,
+                "downloads_count": downloads_count,
                 "leads_count": leads_count,
                 "created_at": ev["created_at"]
             })
@@ -791,7 +845,7 @@ async def get_crm_data():
         ).fetchall()
         return [dict(r) for r in rows]
 
-from datetime import datetime, timedelta
+# Use the global datetime module to avoid shadowing
 @router.post("/superadmin/crm/update")
 async def update_crm_data(
     username: str = Query(...), 
@@ -804,7 +858,7 @@ async def update_crm_data(
             raise HTTPException(status_code=404, detail="User not found")
         
         # Calculate new expiry based on current date + months
-        new_expiry = (datetime.now() + timedelta(days=30 * duration_months)).strftime("%Y-%m-%d")
+        new_expiry = (datetime.datetime.now() + datetime.timedelta(days=30 * duration_months)).strftime("%Y-%m-%d")
         
         conn.execute(
             "UPDATE users SET subscription_price_inr = ?, subscription_duration_months = ?, subscription_expires_at = ? WHERE username = ?",
@@ -1093,14 +1147,19 @@ async def get_event_analytics(event_id: str):
         ).fetchone()
         
         success_cnt = success_row["cnt"] or 0
-        total_matches_cnt = total_matches_row["cnt"] or 0
-        success_rate = round((success_cnt / total_matches_cnt * 100), 1) if total_matches_cnt > 0 else 100.0
-
+        total_matches = total_matches_row["cnt"] or 0
+        success_rate = round((success_cnt / total_matches) * 100) if total_matches > 0 else 0
+        
+        downloads_row = conn.execute(
+            "SELECT COUNT(*) as cnt FROM analytics WHERE event_id = ? AND metric_type IN ('download_photo', 'download_zip')",
+            (event_id,)
+        ).fetchone()
+        
     return {
-        "status": "success",
         "storage_mb": total_mb,
         "total_scans": scan_row["scans"] or 0,
-        "match_success_rate": success_rate
+        "match_success_rate": success_rate,
+        "total_downloads": downloads_row["cnt"] or 0
     }
 
 # --- QR CODE GENERATION ---
@@ -1397,7 +1456,7 @@ async def get_ingestion_status(event_id: str):
     return {"status": "success", "total": total, "scanned": scanned}
 
 # --- SHARED WATERMARK UTILITY ---
-def _apply_watermark_to_bytes(file_url: str, brand_name: str, event_name: str) -> BytesIO:
+def _apply_watermark_to_bytes(file_url: str, brand_name: str, event_name: str, brand_logo_url: Optional[str] = None) -> BytesIO:
     """
     Downloads the image from `file_url`, applies a diagonal semi-transparent watermark
     overlay (brand + event name), and returns a BytesIO of the result as JPEG.
@@ -1416,43 +1475,67 @@ def _apply_watermark_to_bytes(file_url: str, brand_name: str, event_name: str) -
     txt = Image.new("RGBA", image.size, (255, 255, 255, 0))
     d = ImageDraw.Draw(txt)
     w, h = image.size
-    watermark_str = f"{brand_name.upper()} • {event_name.upper()}"
-
-    font_size = max(18, int(w / 28))
-    try:
-        font = ImageFont.truetype("arial.ttf", font_size)
-    except IOError:
+    
+    if brand_logo_url:
         try:
-            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", font_size)
+            logo_resp = requests.get(brand_logo_url, timeout=10.0)
+            logo_resp.raise_for_status()
+            logo = Image.open(BytesIO(logo_resp.content)).convert("RGBA")
+            
+            # Resize logo to fit within a third of the image
+            target_width = int(w / 3)
+            ratio = target_width / float(logo.size[0])
+            target_height = int(float(logo.size[1]) * ratio)
+            logo = logo.resize((target_width, target_height), Image.Resampling.LANCZOS)
+            
+            # Add transparency (e.g., 50% opacity)
+            logo.putalpha(logo.getchannel('A').point(lambda p: p * 0.5))
+            
+            # Paste in center
+            x = int((w - target_width) / 2)
+            y = int((h - target_height) / 2)
+            txt.paste(logo, (x, y), logo)
+            
+        except Exception as e:
+            logger.error(f"Failed to overlay brand logo: {e}")
+            # Fallback to text watermark
+            brand_logo_url = None
+
+    if not brand_logo_url:
+        watermark_str = f"{brand_name.upper()} • {event_name.upper()}"
+        font_size = max(18, int(w / 28))
+        try:
+            font = ImageFont.truetype("arial.ttf", font_size)
         except IOError:
             try:
-                font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", font_size)
+                font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", font_size)
             except IOError:
-                font = ImageFont.load_default()
+                try:
+                    font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", font_size)
+                except IOError:
+                    font = ImageFont.load_default()
 
-    # Diagonal repeating watermark grid
-    step_x = max(int(w / 2.2), 250)
-    step_y = max(int(h / 3.5), 160)
-    
-    for x in range(-50, w + step_x, step_x):
-        for y in range(-50, h + step_y, step_y):
-            # Draw dark outline/shadow for readability on light backgrounds
-            shadow_offset = max(1, font_size // 12)
-            d.text((x + shadow_offset, y + shadow_offset), watermark_str, fill=(0, 0, 0, 90), font=font)
-            # Draw main watermark text in white with good opacity
-            d.text((x, y), watermark_str, fill=(255, 255, 255, 110), font=font)
+        text_bbox = d.textbbox((0, 0), watermark_str, font=font)
+        text_w = text_bbox[2] - text_bbox[0]
+        text_h = text_bbox[3] - text_bbox[1]
+        x = (w - text_w) / 2
+        y = (h - text_h) / 2
 
-    watermarked = Image.alpha_composite(image, txt)
-    rgb_im = watermarked.convert("RGB")
+        d.text((x-2, y-2), watermark_str, font=font, fill=(255, 255, 255, 180))
+        d.text((x+2, y-2), watermark_str, font=font, fill=(255, 255, 255, 180))
+        d.text((x-2, y+2), watermark_str, font=font, fill=(255, 255, 255, 180))
+        d.text((x+2, y+2), watermark_str, font=font, fill=(255, 255, 255, 180))
+        d.text((x, y), watermark_str, font=font, fill=(0, 0, 0, 180))
+
+    watermarked = Image.alpha_composite(image, txt).convert("RGB")
 
     out_buf = BytesIO()
-    rgb_im.save(out_buf, "JPEG", quality=92)
+    watermarked.save(out_buf, "JPEG", quality=92)
     out_buf.seek(0)
 
     image.close()
     txt.close()
     watermarked.close()
-    rgb_im.close()
 
     return out_buf
 
@@ -1465,7 +1548,7 @@ async def get_preview_photo(photo_id: int):
         row = conn.execute(
             """
             SELECT ep.file_url, ep.event_id, e.watermark_enabled, e.name as event_name,
-                   e.logo_filename, u.name as brand_name
+                   u.name, u.brand_name, u.brand_logo_url
             FROM event_photos ep
             JOIN events e ON ep.event_id = e.id
             JOIN users u ON e.owner_username = u.username
@@ -1481,8 +1564,8 @@ async def get_preview_photo(photo_id: int):
     event_id = row["event_id"]
     watermark_enabled = row["watermark_enabled"]
     event_name = row["event_name"]
-    logo_filename = row["logo_filename"]
-    brand_name = row["brand_name"]
+    brand_name = row["brand_name"] if row["brand_name"] else row["name"]
+    brand_logo_url = row["brand_logo_url"]
     
     if not file_url or file_url == "pending_upload":
         raise HTTPException(status_code=404, detail="File does not exist or is pending upload.")
@@ -1499,7 +1582,7 @@ async def get_preview_photo(photo_id: int):
 
     # Apply watermark using shared helper
     try:
-        buffer = await asyncio.to_thread(_apply_watermark_to_bytes, file_url, brand_name, event_name)
+        buffer = await asyncio.to_thread(_apply_watermark_to_bytes, file_url, brand_name, event_name, brand_logo_url)
         return StreamingResponse(buffer, media_type="image/jpeg", headers={"Cache-Control": "public, max-age=3600"})
     except Exception as e:
         logger.error(f"Watermark rendering failed for preview: {e}")
@@ -1516,7 +1599,7 @@ async def download_photo(photo_id: int):
         row = conn.execute(
             """
             SELECT ep.file_url, ep.event_id, e.paywall_enabled,
-                   e.watermark_enabled, e.name as event_name, u.name as brand_name
+                   e.watermark_enabled, e.name as event_name, u.name, u.brand_name, u.brand_logo_url
             FROM event_photos ep
             JOIN events e ON ep.event_id = e.id
             JOIN users u ON e.owner_username = u.username
@@ -1540,7 +1623,12 @@ async def download_photo(photo_id: int):
 
     watermark_enabled = row["watermark_enabled"]
     event_name = row["event_name"]
-    brand_name = row["brand_name"]
+    brand_name = row["brand_name"] if row["brand_name"] else row["name"]
+    brand_logo_url = row["brand_logo_url"]
+    
+    # Log analytics
+    with get_db() as conn:
+        conn.execute("INSERT INTO analytics (event_id, metric_type) VALUES (?, 'download_photo')", (row["event_id"],))
     
     download_headers = {
         "Content-Disposition": f"attachment; filename=photo_{photo_id}.jpg",
@@ -1550,7 +1638,7 @@ async def download_photo(photo_id: int):
     if watermark_enabled:
         # Apply watermark before download — user gets watermarked version
         try:
-            buffer = await asyncio.to_thread(_apply_watermark_to_bytes, file_url, brand_name, event_name)
+            buffer = await asyncio.to_thread(_apply_watermark_to_bytes, file_url, brand_name, event_name, brand_logo_url)
             return StreamingResponse(buffer, media_type="image/jpeg", headers=download_headers)
         except Exception as e:
             logger.error(f"Watermark failed on download for photo {photo_id}: {e}")
@@ -1714,6 +1802,9 @@ async def download_zip(
                 "SELECT file_url FROM event_photos WHERE event_id = ?",
                 (event_id,)
             ).fetchall()
+            
+        # Log analytics
+        conn.execute("INSERT INTO analytics (event_id, metric_type) VALUES (?, 'download_zip')", (event_id,))
         
     # Check watermark setting for this event
     with get_db() as conn:
@@ -1726,11 +1817,13 @@ async def download_zip(
     if wm_row:
         with get_db() as conn:
             brand_row = conn.execute(
-                "SELECT name FROM users WHERE username = ?", (wm_row["owner_username"],)
+                "SELECT name, brand_name, brand_logo_url FROM users WHERE username = ?", (wm_row["owner_username"],)
             ).fetchone()
-        wm_brand_name = brand_row["name"] if brand_row else ""
+        wm_brand_name = (brand_row["brand_name"] if brand_row["brand_name"] else brand_row["name"]) if brand_row else ""
+        wm_brand_logo_url = brand_row["brand_logo_url"] if brand_row else None
     else:
         wm_brand_name = ""
+        wm_brand_logo_url = None
 
     file_urls = [r["file_url"] for r in rows]
     if not file_urls:
@@ -1743,7 +1836,7 @@ async def download_zip(
                 try:
                     if watermark_for_zip:
                         # Apply watermark to each photo before adding to ZIP
-                        wm_buf = _apply_watermark_to_bytes(url, wm_brand_name, wm_event_name)
+                        wm_buf = _apply_watermark_to_bytes(url, wm_brand_name, wm_event_name, wm_brand_logo_url)
                         zip_file.writestr(f"photo_{idx+1}.jpg", wm_buf.read())
                     else:
                         resp = requests.get(url, timeout=30.0)
